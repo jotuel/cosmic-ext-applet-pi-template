@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "pi-rpc",
+    "cosmic-ext-pi",
+    "cosmic-ext-applet-pi",
+]
