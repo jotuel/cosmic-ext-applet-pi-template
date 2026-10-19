@@ -1,0 +1,53 @@
+[package]
+name = "cosmic-ext-applet-pi"
+version = "0.1.0"
+edition = "2024"
+license = "EUPL-1.2"
+description = "Pi™ RPC applet for COSMIC™ panel"
+repository = "https://github.com/jotuel/cosmic-ext-applet-pi"
+
+[build-dependencies]
+xdgen = "0.1"
+
+[dependencies]
+i18n-embed-fl = "0.10"
+rust-embed = "8.11"
+tokio = { version = "1.52.0", features = ["full"] }
+pi-rpc = { path = "../pi-rpc" }
+cosmic-ext-pi = { path = "../cosmic-ext-pi" }
+notify-rust = "4"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rfd = "0.15"
+walkdir = "2"
+base64 = "0.22"
+
+[dependencies.i18n-embed]
+version = "0.16"
+features = ["fluent-system", "desktop-requester"]
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+# See https://github.com/pop-os/libcosmic/blob/master/Cargo.toml for available features.
+features = [
+    # Applet support
+    "applet",
+    "applet-token",
+    # Uses cosmic-settings-daemon to watch for config file changes
+    "dbus-config",
+    # Support creating additional application windows.
+    "multi-window",
+    # Uses tokio as the executor for the runtime
+    "tokio",
+    # Add Wayland support to winit
+    "wayland",
+    # Windowing support for X11, Windows, Mac, & Redox
+    "winit",
+]
+
+# Uncomment to test a locally-cloned libcosmic
+# [patch.'https://github.com/pop-os/libcosmic']
+# libcosmic = { path = "../libcosmic" }
+# cosmic-config = { path = "../libcosmic/cosmic-config" }
+# cosmic-theme = { path = "../libcosmic/cosmic-theme" }
