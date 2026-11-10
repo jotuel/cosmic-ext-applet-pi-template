@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
+use super::events::{ModelRef, UsageState};
+
 /// Image payload format supported by Pi prompts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageContent {
@@ -20,12 +22,13 @@ impl ImageContent {
     }
 }
 
-/// Delivery behavior when sending a prompt during active streaming.
+/// Delivery behavior when submitting input to a busy conversation (`whenBusy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StreamingBehavior {
     Steer,
     FollowUp,
+    Reject,
 }
 
 /// Delivery mode for queue items (steering or follow-up).
@@ -50,7 +53,7 @@ pub enum ThinkingLevel {
     Max,
 }
 
-/// Disposition returned after submitting a prompt.
+/// Disposition returned after submitting input to the durable conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptDisposition {
@@ -67,14 +70,16 @@ pub enum QueuedInputDisposition {
     Handled,
 }
 
-/// A request to prompt the agent.
+/// A request to submit user input to the durable conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageContent>>,
-    #[serde(rename = "streamingBehavior", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "whenBusy", alias = "streamingBehavior", skip_serializing_if = "Option::is_none")]
     pub streaming_behavior: Option<StreamingBehavior>,
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl PromptRequest {
@@ -83,6 +88,7 @@ impl PromptRequest {
             message: message.into(),
             images: None,
             streaming_behavior: None,
+            request_id: None,
         }
     }
 
@@ -93,6 +99,11 @@ impl PromptRequest {
 
     pub fn with_streaming_behavior(mut self, behavior: StreamingBehavior) -> Self {
         self.streaming_behavior = Some(behavior);
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
         self
     }
 }
@@ -109,20 +120,21 @@ impl From<String> for PromptRequest {
     }
 }
 
-
-/// All commands supported by `pi --mode rpc` over stdin.
+/// Commands supported by the Pi Durable host over stdin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RpcCommand {
-    #[serde(rename = "prompt")]
-    Prompt {
+    #[serde(rename = "submit", alias = "prompt")]
+    Submit {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<Vec<ImageContent>>,
-        #[serde(rename = "streamingBehavior", skip_serializing_if = "Option::is_none")]
-        streaming_behavior: Option<StreamingBehavior>,
+        #[serde(rename = "whenBusy", alias = "streamingBehavior", skip_serializing_if = "Option::is_none")]
+        when_busy: Option<StreamingBehavior>,
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     #[serde(rename = "steer")]
@@ -155,12 +167,26 @@ pub enum RpcCommand {
         id: Option<String>,
     },
 
-    #[serde(rename = "new_session")]
-    NewSession {
+    #[serde(rename = "reset", alias = "new_session")]
+    Reset {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(rename = "parentSession", skip_serializing_if = "Option::is_none")]
-        parent_session: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        handoff: Option<String>,
+    },
+
+    #[serde(rename = "configure")]
+    Configure {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<ModelRef>,
+        #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+        thinking_level: Option<ThinkingLevel>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
     },
 
     #[serde(rename = "get_state")]
@@ -260,70 +286,8 @@ pub enum RpcCommand {
         exclude_from_context: Option<bool>,
     },
 
-    #[serde(rename = "abort_bash")]
-    AbortBash {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-    },
-
     #[serde(rename = "get_session_stats")]
     GetSessionStats {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-    },
-
-    #[serde(rename = "export_html")]
-    ExportHtml {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        #[serde(rename = "outputPath", skip_serializing_if = "Option::is_none")]
-        output_path: Option<String>,
-    },
-
-    #[serde(rename = "switch_session")]
-    SwitchSession {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        #[serde(rename = "sessionPath")]
-        session_path: String,
-    },
-
-    #[serde(rename = "fork")]
-    Fork {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        #[serde(rename = "entryId")]
-        entry_id: String,
-    },
-
-    #[serde(rename = "clone")]
-    CloneSession {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-    },
-
-    #[serde(rename = "get_fork_messages")]
-    GetForkMessages {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-    },
-
-    #[serde(rename = "get_entries")]
-    GetEntries {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        since: Option<String>,
-    },
-
-    #[serde(rename = "get_tree")]
-    GetTree {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-    },
-
-    #[serde(rename = "get_last_assistant_text")]
-    GetLastAssistantText {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
@@ -351,12 +315,13 @@ pub enum RpcCommand {
 impl RpcCommand {
     pub fn id(&self) -> Option<&str> {
         match self {
-            Self::Prompt { id, .. }
+            Self::Submit { id, .. }
             | Self::Steer { id, .. }
             | Self::FollowUp { id, .. }
             | Self::Abort { id }
             | Self::ClearQueue { id }
-            | Self::NewSession { id, .. }
+            | Self::Reset { id, .. }
+            | Self::Configure { id, .. }
             | Self::GetState { id }
             | Self::SetModel { id, .. }
             | Self::CycleModel { id }
@@ -371,16 +336,7 @@ impl RpcCommand {
             | Self::SetAutoRetry { id, .. }
             | Self::AbortRetry { id }
             | Self::Bash { id, .. }
-            | Self::AbortBash { id }
             | Self::GetSessionStats { id }
-            | Self::ExportHtml { id, .. }
-            | Self::SwitchSession { id, .. }
-            | Self::Fork { id, .. }
-            | Self::CloneSession { id }
-            | Self::GetForkMessages { id }
-            | Self::GetEntries { id, .. }
-            | Self::GetTree { id }
-            | Self::GetLastAssistantText { id }
             | Self::SetSessionName { id, .. }
             | Self::GetMessages { id }
             | Self::GetCommands { id } => id.as_deref(),
@@ -389,12 +345,13 @@ impl RpcCommand {
 
     pub fn set_id(&mut self, new_id: String) {
         match self {
-            Self::Prompt { id, .. }
+            Self::Submit { id, .. }
             | Self::Steer { id, .. }
             | Self::FollowUp { id, .. }
             | Self::Abort { id }
             | Self::ClearQueue { id }
-            | Self::NewSession { id, .. }
+            | Self::Reset { id, .. }
+            | Self::Configure { id, .. }
             | Self::GetState { id }
             | Self::SetModel { id, .. }
             | Self::CycleModel { id }
@@ -409,16 +366,7 @@ impl RpcCommand {
             | Self::SetAutoRetry { id, .. }
             | Self::AbortRetry { id }
             | Self::Bash { id, .. }
-            | Self::AbortBash { id }
             | Self::GetSessionStats { id }
-            | Self::ExportHtml { id, .. }
-            | Self::SwitchSession { id, .. }
-            | Self::Fork { id, .. }
-            | Self::CloneSession { id }
-            | Self::GetForkMessages { id }
-            | Self::GetEntries { id, .. }
-            | Self::GetTree { id }
-            | Self::GetLastAssistantText { id }
             | Self::SetSessionName { id, .. }
             | Self::GetMessages { id }
             | Self::GetCommands { id } => *id = Some(new_id),
@@ -454,8 +402,13 @@ pub struct CommandResponse<T> {
 // ---------------- Response Payload Structs ----------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptData {
     pub disposition: PromptDisposition,
+    #[serde(default)]
+    pub submission_id: Option<u64>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,7 +429,7 @@ pub struct SessionCancelledData {
     pub cancelled: bool,
 }
 
-/// Model definition returned by Pi.
+/// Model definition returned by Pi Durable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -562,6 +515,8 @@ pub struct SessionStats {
     pub session_file: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub usage: Option<UsageState>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -569,43 +524,18 @@ pub struct SessionStats {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionResult {
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub first_kept_entry_id: String,
+    #[serde(default)]
     pub tokens_before: usize,
+    #[serde(default)]
     pub estimated_tokens_after: usize,
     #[serde(default)]
     pub usage: Option<serde_json::Value>,
     #[serde(default)]
     pub details: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExportHtmlData {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkData {
-    pub text: String,
-    pub cancelled: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkMessage {
-    #[serde(rename = "entryId")]
-    pub entry_id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkMessagesData {
-    pub messages: Vec<ForkMessage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LastAssistantTextData {
-    #[serde(default)]
-    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

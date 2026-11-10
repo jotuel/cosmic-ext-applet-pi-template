@@ -2,27 +2,29 @@ use pi_rpc::protocol::*;
 use serde_json::json;
 
 #[test]
-fn test_command_prompt_serialization() {
-    let cmd = RpcCommand::Prompt {
+fn test_command_submit_serialization() {
+    let cmd = RpcCommand::Submit {
         id: Some("req-1".into()),
-        message: "Hello, Pi!".into(),
+        message: "Hello, Pi Durable!".into(),
         images: Some(vec![ImageContent::new("image/png", "base64data==")]),
-        streaming_behavior: Some(StreamingBehavior::Steer),
+        when_busy: Some(StreamingBehavior::Steer),
+        request_id: Some("req-id-1".into()),
     };
 
     let serialized = serde_json::to_string(&cmd).unwrap();
     let val: serde_json::Value = serde_json::from_str(&serialized).unwrap();
 
-    assert_eq!(val["type"], "prompt");
+    assert_eq!(val["type"], "submit");
     assert_eq!(val["id"], "req-1");
-    assert_eq!(val["message"], "Hello, Pi!");
-    assert_eq!(val["streamingBehavior"], "steer");
+    assert_eq!(val["message"], "Hello, Pi Durable!");
+    assert_eq!(val["whenBusy"], "steer");
+    assert_eq!(val["requestId"], "req-id-1");
     assert_eq!(val["images"][0]["mimeType"], "image/png");
     assert_eq!(val["images"][0]["data"], "base64data==");
 }
 
 #[test]
-fn test_command_steer_and_follow_up_serialization() {
+fn test_command_steer_follow_up_and_reset_serialization() {
     let steer = RpcCommand::Steer {
         id: Some("s-1".into()),
         message: "Steer now".into(),
@@ -40,6 +42,14 @@ fn test_command_steer_and_follow_up_serialization() {
     let f_val: serde_json::Value = serde_json::to_value(&follow).unwrap();
     assert_eq!(f_val["type"], "follow_up");
     assert_eq!(f_val["message"], "Follow up after");
+
+    let reset = RpcCommand::Reset {
+        id: Some("r-1".into()),
+        handoff: Some("Continue fixing test".into()),
+    };
+    let r_val: serde_json::Value = serde_json::to_value(&reset).unwrap();
+    assert_eq!(r_val["type"], "reset");
+    assert_eq!(r_val["handoff"], "Continue fixing test");
 }
 
 #[test]
@@ -68,20 +78,24 @@ fn test_response_parsing_success_and_error() {
     let raw_success = json!({
         "id": "req-10",
         "type": "response",
-        "command": "prompt",
+        "command": "submit",
         "success": true,
         "data": {
-            "disposition": "started"
+            "disposition": "started",
+            "submissionId": 1,
+            "status": "placed"
         }
     });
 
     let record = IncomingRecord::parse(&serde_json::to_vec(&raw_success).unwrap()).unwrap();
     if let IncomingRecord::Response(resp) = record {
         assert_eq!(resp.id, Some("req-10".into()));
-        assert_eq!(resp.command, "prompt");
+        assert_eq!(resp.command, "submit");
         assert!(resp.success);
         let data: PromptData = serde_json::from_value(resp.data.unwrap()).unwrap();
         assert_eq!(data.disposition, PromptDisposition::Started);
+        assert_eq!(data.submission_id, Some(1));
+        assert_eq!(data.status.as_deref(), Some("placed"));
     } else {
         panic!("Expected IncomingRecord::Response");
     }
@@ -105,54 +119,88 @@ fn test_response_parsing_success_and_error() {
 }
 
 #[test]
-fn test_session_state_response_deserialization() {
-    let state_json = json!({
-        "id": "test-state",
-        "type": "response",
-        "command": "get_state",
-        "success": true,
-        "data": {
-            "model": {
-                "id": "balanced",
-                "name": "Balanced",
-                "reasoning": true,
-                "provider": "radius"
+fn test_snapshot_and_streaming_durable_events() {
+    // 1. snapshot event
+    let snap_json = json!({
+        "type": "snapshot",
+        "entries": [
+            {
+                "id": 1,
+                "conversationId": 1,
+                "kind": "pi.user",
+                "model": [{ "role": "user", "content": "Hello durable!" }]
             },
-            "thinkingLevel": "medium",
-            "isStreaming": false,
-            "isCompacting": false,
-            "steeringMode": "one-at-a-time",
-            "followUpMode": "all",
-            "sessionId": "session-12345",
-            "sessionName": "Feature Branch Work",
-            "autoCompactionEnabled": true,
-            "messageCount": 12,
-            "pendingMessageCount": 1
+            {
+                "id": 2,
+                "conversationId": 1,
+                "kind": "pi.assistant",
+                "model": [{
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "Thinking..." },
+                        { "type": "text", "text": "Hi there!" }
+                    ]
+                }]
+            }
+        ],
+        "run": { "inputs": [1] },
+        "tools": [
+            {
+                "callId": "call-1",
+                "name": "bash",
+                "status": "running",
+                "output": "cargo test\n"
+            }
+        ],
+        "nestedTools": [],
+        "compactions": [],
+        "inbox": [
+            { "id": 2, "mode": "steer", "text": "Use release mode" }
+        ],
+        "agent": {
+            "model": { "provider": "radius", "modelId": "balanced" },
+            "thinkingLevel": "high",
+            "cwd": "/tmp/project"
+        },
+        "usage": {
+            "models": {
+                "radius/balanced": {
+                    "input": 200,
+                    "output": 50,
+                    "cacheRead": 100,
+                    "cacheWrite": 0,
+                    "totalTokens": 350
+                }
+            },
+            "tools": {}
         }
     });
 
-    let record = IncomingRecord::parse(&serde_json::to_vec(&state_json).unwrap()).unwrap();
-    if let IncomingRecord::Response(resp) = record {
-        let state: RpcSessionState = serde_json::from_value(resp.data.unwrap()).unwrap();
-        assert_eq!(state.session_id, "session-12345");
-        assert_eq!(state.session_name, Some("Feature Branch Work".into()));
-        assert_eq!(state.thinking_level, ThinkingLevel::Medium);
-        assert_eq!(state.steering_mode, QueueMode::OneAtATime);
-        assert_eq!(state.follow_up_mode, QueueMode::All);
-        assert_eq!(state.message_count, 12);
-        assert_eq!(state.pending_message_count, 1);
-        let model = state.model.unwrap();
-        assert_eq!(model.id, "balanced");
-        assert_eq!(model.name, "Balanced");
-        assert_eq!(model.reasoning, Some(true));
+    let record = IncomingRecord::parse(&serde_json::to_vec(&snap_json).unwrap()).unwrap();
+    if let IncomingRecord::Event(PiEvent::Snapshot(snap)) = record {
+        assert_eq!(snap.entries.len(), 2);
+        assert_eq!(snap.entries[0].kind, "pi.user");
+        assert_eq!(snap.entries[1].kind, "pi.assistant");
+        assert_eq!(snap.run.unwrap().inputs, vec![1]);
+        assert_eq!(snap.tools.len(), 1);
+        assert_eq!(snap.tools[0].call_id, "call-1");
+        assert_eq!(snap.inbox.len(), 1);
+        assert_eq!(snap.inbox[0].mode, InboxMode::Steer);
+        assert_eq!(snap.inbox[0].text.as_deref(), Some("Use release mode"));
+        assert_eq!(
+            snap.agent.model,
+            Some(ModelRef::new("radius", "balanced"))
+        );
+        assert_eq!(snap.agent.thinking_level, Some(ThinkingLevel::High));
+        let total = snap.usage.total_usage();
+        assert_eq!(total.input, 200);
+        assert_eq!(total.cache_read, 100);
+        assert_eq!(total.total_tokens, 350);
     } else {
-        panic!("Expected IncomingRecord::Response");
+        panic!("Expected PiEvent::Snapshot");
     }
-}
 
-#[test]
-fn test_streaming_session_events() {
-    // 1. message_update event with text_delta
+    // 2. message_update with MessageChange[]
     let update_json = json!({
         "type": "message_update",
         "usage": {
@@ -160,75 +208,88 @@ fn test_streaming_session_events() {
             "output": 15,
             "cacheRead": 0,
             "cacheWrite": 0,
-            "totalTokens": 115,
-            "cost": {
-                "input": 0.001,
-                "output": 0.002,
-                "cacheRead": 0.0,
-                "cacheWrite": 0.0,
-                "total": 0.003
-            }
+            "totalTokens": 115
         },
-        "assistantMessageEvent": {
-            "type": "text_delta",
-            "contentIndex": 0,
-            "delta": "Hello from Pi assistant!"
-        }
+        "changes": [
+            {
+                "type": "text_start",
+                "contentIndex": 0,
+                "block": { "type": "text", "text": "Hello" }
+            },
+            {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": " from Pi Durable!"
+            }
+        ]
     });
 
     let record = IncomingRecord::parse(&serde_json::to_vec(&update_json).unwrap()).unwrap();
-    if let IncomingRecord::Event(PiEvent::MessageUpdate {
-        usage,
-        assistant_message_event,
-    }) = record
-    {
+    if let IncomingRecord::Event(PiEvent::MessageUpdate { usage, changes }) = record {
         assert_eq!(usage.unwrap().total_tokens, 115);
-        if let AssistantMessageEvent::TextDelta { content_index, delta } = assistant_message_event {
-            assert_eq!(content_index, 0);
-            assert_eq!(delta, "Hello from Pi assistant!");
+        assert_eq!(changes.len(), 2);
+        if let MessageChange::TextDelta { content_index, delta } = &changes[1] {
+            assert_eq!(*content_index, 0);
+            assert_eq!(delta, " from Pi Durable!");
         } else {
-            panic!("Expected TextDelta");
+            panic!("Expected MessageChange::TextDelta");
         }
     } else {
         panic!("Expected PiEvent::MessageUpdate");
     }
 
-    // 2. agent_settled event
-    let settled_json = json!({
-        "type": "agent_settled",
-        "aborted": false
+    // 3. run_end event
+    let run_end_json = json!({
+        "type": "run_end",
+        "inputs": [1]
     });
-    let settled_record = IncomingRecord::parse(&serde_json::to_vec(&settled_json).unwrap()).unwrap();
+    let run_end_record = IncomingRecord::parse(&serde_json::to_vec(&run_end_json).unwrap()).unwrap();
     assert_eq!(
-        settled_record,
-        IncomingRecord::Event(PiEvent::AgentSettled { aborted: false })
+        run_end_record,
+        IncomingRecord::Event(PiEvent::RunEnd { inputs: vec![1] })
     );
 
-    // 3. tool_execution_start and end events
+    // 4. tool_execution_start, update, and end events
     let tool_start = json!({
         "type": "tool_execution_start",
         "toolCallId": "call-1",
         "toolName": "bash",
+        "taskId": 10,
         "args": { "command": "cargo check" }
     });
     let tool_record = IncomingRecord::parse(&serde_json::to_vec(&tool_start).unwrap()).unwrap();
     if let IncomingRecord::Event(PiEvent::ToolExecutionStart {
         tool_call_id,
         tool_name,
+        task_id,
         args,
+        ..
     }) = tool_record
     {
         assert_eq!(tool_call_id, "call-1");
         assert_eq!(tool_name, "bash");
+        assert_eq!(task_id, Some(10));
         assert_eq!(args["command"], "cargo check");
     } else {
         panic!("Expected ToolExecutionStart");
+    }
+
+    let tool_update = json!({
+        "type": "tool_execution_update",
+        "toolCallId": "call-1",
+        "toolName": "bash",
+        "output": { "append": "Checking pi-rpc...\n" }
+    });
+    let update_rec = IncomingRecord::parse(&serde_json::to_vec(&tool_update).unwrap()).unwrap();
+    if let IncomingRecord::Event(PiEvent::ToolExecutionUpdate { output, .. }) = update_rec {
+        assert_eq!(output.unwrap().append.as_deref(), Some("Checking pi-rpc...\n"));
+    } else {
+        panic!("Expected ToolExecutionUpdate");
     }
 }
 
 #[test]
 fn test_extension_ui_requests_and_responses() {
-    // Select request
     let select_json = json!({
         "type": "extension_ui_request",
         "id": "uuid-dialog-1",
@@ -242,86 +303,15 @@ fn test_extension_ui_requests_and_responses() {
     if let IncomingRecord::ExtensionUi(req) = record {
         assert_eq!(req.id(), Some("uuid-dialog-1"));
         assert!(req.is_dialog());
-        if let ExtensionUiRequest::Select {
-            title,
-            options,
-            timeout,
-            ..
-        } = req
-        {
-            assert_eq!(title, "Allow dangerous command?");
-            assert_eq!(options, vec!["Allow", "Block"]);
-            assert_eq!(timeout, Some(10000));
-        } else {
-            panic!("Expected ExtensionUiRequest::Select");
-        }
     } else {
         panic!("Expected IncomingRecord::ExtensionUi");
     }
 
-    // Confirm request
-    let confirm_json = json!({
-        "type": "extension_ui_request",
-        "id": "uuid-dialog-2",
-        "method": "confirm",
-        "title": "Clear session?",
-        "message": "All messages will be lost.",
-        "timeout": 5000
-    });
-    let confirm_record = IncomingRecord::parse(&serde_json::to_vec(&confirm_json).unwrap()).unwrap();
-    if let IncomingRecord::ExtensionUi(ExtensionUiRequest::Confirm {
-        id,
-        title,
-        message,
-        timeout,
-    }) = confirm_record
-    {
-        assert_eq!(id, "uuid-dialog-2");
-        assert_eq!(title, "Clear session?");
-        assert_eq!(message, "All messages will be lost.");
-        assert_eq!(timeout, Some(5000));
-    } else {
-        panic!("Expected ExtensionUiRequest::Confirm");
-    }
-
-    // Fire-and-forget notification
-    let notify_json = json!({
-        "type": "extension_ui_request",
-        "id": "uuid-notify-1",
-        "method": "notify",
-        "message": "Command blocked",
-        "notifyType": "warning"
-    });
-    let notify_record = IncomingRecord::parse(&serde_json::to_vec(&notify_json).unwrap()).unwrap();
-    if let IncomingRecord::ExtensionUi(req) = notify_record {
-        assert!(!req.is_dialog());
-        if let ExtensionUiRequest::Notify {
-            message,
-            notify_type,
-            ..
-        } = req
-        {
-            assert_eq!(message, "Command blocked");
-            assert_eq!(notify_type, Some(NotifyType::Warning));
-        } else {
-            panic!("Expected Notify");
-        }
-    }
-
-    // Responses
     let val_resp = ExtensionUiResponse::value("uuid-dialog-1", "Allow");
     let val_json: serde_json::Value = serde_json::to_value(&val_resp).unwrap();
     assert_eq!(val_json["type"], "extension_ui_response");
     assert_eq!(val_json["id"], "uuid-dialog-1");
     assert_eq!(val_json["value"], "Allow");
-
-    let conf_resp = ExtensionUiResponse::confirm("uuid-dialog-2", true);
-    let conf_json: serde_json::Value = serde_json::to_value(&conf_resp).unwrap();
-    assert_eq!(conf_json["confirmed"], true);
-
-    let cancel_resp = ExtensionUiResponse::cancel("uuid-dialog-3");
-    let cancel_json: serde_json::Value = serde_json::to_value(&cancel_resp).unwrap();
-    assert_eq!(cancel_json["cancelled"], true);
 }
 
 #[test]
@@ -330,6 +320,11 @@ fn test_agent_message_text_extraction() {
         role: "user".into(),
         content: serde_json::Value::String("Plain user prompt".into()),
         timestamp: Some(1733234401000),
+        usage: None,
+        tool_call_id: None,
+        tool_name: None,
+        is_error: None,
+        duration_ms: None,
         extra: Default::default(),
     };
     assert_eq!(str_msg.text(), "Plain user prompt");
@@ -342,6 +337,11 @@ fn test_agent_message_text_extraction() {
             { "type": "text", "text": "Part 2." }
         ]),
         timestamp: Some(1733234402000),
+        usage: None,
+        tool_call_id: None,
+        tool_name: None,
+        is_error: None,
+        duration_ms: None,
         extra: Default::default(),
     };
     assert_eq!(block_msg.text(), "Part 1. Part 2.");

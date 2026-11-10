@@ -4,7 +4,8 @@ use std::sync::Arc;
 use cosmic::iced::Task;
 use cosmic::Element;
 use pi_rpc::protocol::{
-    AssistantMessageEvent, ExtensionUiRequest, ExtensionUiResponse, PiEvent, ThinkingLevel, Usage,
+    EntryRecord, ExtensionUiRequest, ExtensionUiResponse, InboxMode, MessageChange, PiEvent,
+    QueuedItem, SnapshotEvent, ThinkingLevel, ToolOutputUpdate, Usage,
 };
 use pi_rpc::PiClient;
 use uuid::Uuid;
@@ -13,7 +14,7 @@ use crate::dialogs::{ConfirmDialog, DialogState, EditorDialog, InputDialog, Sele
 use crate::subscription::PiAction;
 use crate::widget::{ChatView, StatusBadge};
 
-/// High-level operational status of the Pi agent.
+/// High-level operational status of the Pi Durable agent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
     /// Agent is idle and ready for new instructions.
@@ -183,6 +184,141 @@ impl ChatMessage {
     }
 }
 
+/// Extracts `errorMessage` from an assistant `AgentMessage` if present and non-empty.
+fn assistant_error_message(msg: &pi_rpc::protocol::AgentMessage) -> Option<&str> {
+    msg.extra
+        .get("errorMessage")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parses an assistant `AgentMessage` (including any `errorMessage`) into `MessageBlock` items.
+fn parse_assistant_message_blocks(
+    msg: &pi_rpc::protocol::AgentMessage,
+    is_streaming: bool,
+) -> Vec<MessageBlock> {
+    let mut blocks = parse_assistant_content_blocks(&msg.content, is_streaming);
+    if let Some(err_msg) = assistant_error_message(msg) {
+        let already_has = blocks
+            .iter()
+            .any(|b| matches!(b, MessageBlock::Text { text, .. } if text.contains(err_msg)));
+        if !already_has {
+            let formatted = format!("⚠️ **Error:** {err_msg}");
+            blocks.push(MessageBlock::Text {
+                parsed: cosmic::iced::widget::markdown::parse(&formatted).collect(),
+                text: formatted,
+            });
+        }
+    }
+    blocks
+}
+
+/// Parses an assistant message's `content` value into `MessageBlock` items.
+fn parse_assistant_content_blocks(
+    content: &serde_json::Value,
+    is_streaming: bool,
+) -> Vec<MessageBlock> {
+    let mut blocks = Vec::new();
+    match content {
+        serde_json::Value::String(s) if !s.is_empty() => {
+            blocks.push(MessageBlock::Text {
+                parsed: if is_streaming {
+                    Vec::new()
+                } else {
+                    cosmic::iced::widget::markdown::parse(s).collect()
+                },
+                text: s.clone(),
+            });
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(block) = parse_single_content_block(item, is_streaming) {
+                    blocks.push(block);
+                }
+            }
+        }
+        _ => {}
+    }
+    blocks
+}
+
+fn parse_single_content_block(
+    item: &serde_json::Value,
+    is_streaming: bool,
+) -> Option<MessageBlock> {
+    let block_type = item.get("type").and_then(|v| v.as_str())?;
+    match block_type {
+        "thinking" => {
+            let text = item
+                .get("thinking")
+                .or_else(|| item.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !is_streaming && text.is_empty() {
+                return None;
+            }
+            Some(MessageBlock::Thinking {
+                text,
+                collapsed: true,
+                is_streaming,
+            })
+        }
+        "text" => {
+            let text = item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !is_streaming && text.is_empty() {
+                return None;
+            }
+            let parsed = if is_streaming || text.is_empty() {
+                Vec::new()
+            } else {
+                cosmic::iced::widget::markdown::parse(&text).collect()
+            };
+            Some(MessageBlock::Text { text, parsed })
+        }
+        "toolCall" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .get("name")
+                .or_else(|| item.get("toolName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool")
+                .to_string();
+            let args = item
+                .get("arguments")
+                .or_else(|| item.get("args"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let args_raw = if args.is_null() {
+                String::new()
+            } else {
+                serde_json::to_string(&args).unwrap_or_default()
+            };
+            Some(MessageBlock::ToolCall(ToolCallData {
+                id,
+                name,
+                args,
+                args_raw,
+                partial_result: None,
+                result: None,
+                is_error: false,
+                duration_ms: None,
+                collapsed: true,
+                is_executing: is_streaming,
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Human-readable metadata for a built-in or discovered slash command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlashCommandInfo {
@@ -191,7 +327,7 @@ pub struct SlashCommandInfo {
     pub is_builtin: bool,
 }
 
-/// Session controller managing Pi RPC connection, session state, chat history,
+/// Session controller managing Pi Durable RPC connection, session state, chat history,
 /// extension UI requests, and UI rendering.
 pub struct PiSessionController {
     client: Arc<PiClient>,
@@ -209,13 +345,14 @@ pub struct PiSessionController {
     steering_queue: Vec<String>,
     follow_up_queue: Vec<String>,
     discovered_commands: Vec<pi_rpc::protocol::RpcSlashCommand>,
+    current_turn_block_offset: usize,
 }
 
 impl PiSessionController {
     /// Creates a new `PiSessionController` wrapping a running `PiClient`.
     pub fn new(client: Arc<PiClient>) -> Self {
-        Self {
-            client,
+        let mut ctrl = Self {
+            client: Arc::clone(&client),
             status: AgentStatus::Idle,
             session_id: None,
             session_name: None,
@@ -230,7 +367,14 @@ impl PiSessionController {
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),
             discovered_commands: Vec::new(),
+            current_turn_block_offset: 0,
+        };
+
+        if let Some(snap) = client.latest_snapshot() {
+            ctrl.hydrate_from_snapshot(snap);
         }
+
+        ctrl
     }
 
     pub fn client(&self) -> &Arc<PiClient> {
@@ -316,7 +460,7 @@ impl PiSessionController {
             |res| match res {
                 Ok(cmds) => PiAction::SlashCommandsLoaded(cmds),
                 Err(e) => {
-                    tracing::warn!("Failed to fetch discoverable commands from Pi RPC: {e}");
+                    tracing::warn!("Failed to fetch discoverable commands from Pi Durable RPC: {e}");
                     PiAction::Noop
                 }
             },
@@ -545,6 +689,12 @@ impl PiSessionController {
                             .extra
                             .get("cost")
                             .and_then(|v| v.as_f64())
+                            .or_else(|| {
+                                stats
+                                    .usage
+                                    .as_ref()
+                                    .and_then(|u| u.total_usage().cost.map(|c| c.total))
+                            })
                             .unwrap_or(0.0);
                         let (input, output, cache_read, cache_write) =
                             if let Some(toks) = stats.extra.get("tokens") {
@@ -553,6 +703,14 @@ impl PiSessionController {
                                     toks.get("output").and_then(|v| v.as_u64()).unwrap_or(0),
                                     toks.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0),
                                     toks.get("cacheWrite").and_then(|v| v.as_u64()).unwrap_or(0),
+                                )
+                            } else if let Some(ref usage_state) = stats.usage {
+                                let total = usage_state.total_usage();
+                                (
+                                    total.input,
+                                    total.output,
+                                    total.cache_read,
+                                    total.cache_write,
                                 )
                             } else {
                                 (0, 0, 0, 0)
@@ -677,7 +835,9 @@ impl PiSessionController {
                         self.status = AgentStatus::Idle;
                     }
                     Ok(pi_rpc::protocol::PromptDisposition::Started) => {
-                        self.status = AgentStatus::Thinking;
+                        if !self.status.is_busy() {
+                            self.status = AgentStatus::Thinking;
+                        }
                     }
                     Ok(pi_rpc::protocol::PromptDisposition::Queued) => {
                         // Prompt was queued behind active work.
@@ -695,7 +855,7 @@ impl PiSessionController {
         }
     }
 
-    /// Submits a prompt request to Pi, intercepting client-side slash commands
+    /// Submits a prompt request to Pi Durable, intercepting client-side slash commands
     /// and routing discovered commands/skills to the RPC engine.
     pub fn submit_prompt_request(
         &mut self,
@@ -717,7 +877,7 @@ impl PiSessionController {
         })
     }
 
-    /// Submits a prompt to Pi, intercepting client-side slash commands (e.g. `/help`, `/compact`, `/new`)
+    /// Submits a prompt to Pi Durable, intercepting client-side slash commands (e.g. `/help`, `/compact`, `/new`)
     /// and routing discovered commands/skills to the RPC engine.
     pub fn submit_prompt(&mut self, text: impl Into<String>) -> Task<PiAction> {
         self.submit_prompt_request(pi_rpc::protocol::PromptRequest::new(text))
@@ -765,7 +925,7 @@ impl PiSessionController {
                 self.status = AgentStatus::Thinking;
 
                 let client = Arc::clone(&self.client);
-                Task::perform(async move { client.new_session(None).await }, |res| {
+                Task::perform(async move { client.reset(None).await }, |res| {
                     PiAction::SessionResetCompleted(res.map(|_| ()).map_err(|e| e.to_string()))
                 })
             }
@@ -818,21 +978,28 @@ impl PiSessionController {
                                     .find(|m| m.id == target || m.name == target)
                                 {
                                     (
-                                        found
-                                            .provider
-                                            .clone()
-                                            .unwrap_or_else(|| "anthropic".to_string()),
+                                        found.provider.clone().unwrap_or_default(),
                                         found.id.clone(),
                                     )
                                 } else {
-                                    ("anthropic".to_string(), target.clone())
+                                    (String::new(), target.clone())
                                 }
                             } else {
-                                ("anthropic".to_string(), target.clone())
+                                (String::new(), target.clone())
                             };
                             client.set_model(provider, model_id).await
                         },
-                        |res| PiAction::ModelChanged(res.map(|m| m.id).map_err(|e| e.to_string())),
+                        |res| {
+                            PiAction::ModelChanged(
+                                res.map(|m| match m.provider {
+                                    Some(ref p) if !p.is_empty() && !m.id.contains('/') => {
+                                        format!("{p}/{}", m.id)
+                                    }
+                                    _ => m.id,
+                                })
+                                .map_err(|e| e.to_string()),
+                            )
+                        },
                     )
                 }
             }
@@ -1081,98 +1248,496 @@ impl PiSessionController {
         )
     }
 
+    /// Hydrates full controller state from a `SnapshotEvent` emitted on attachment or overflow.
+    pub fn hydrate_from_snapshot(&mut self, snap: SnapshotEvent) {
+        self.history.clear();
+        self.current_turn_block_offset = 0;
+
+        // Filter to active range if a head marker is present
+        let active_entries: Vec<&EntryRecord> = if let Some((head_idx, head_entry)) = snap
+            .entries
+            .iter()
+            .enumerate()
+            .rfind(|(_, e)| e.head.is_some())
+        {
+            let target_id = head_entry.head.unwrap_or(head_entry.id);
+            let mut slice = vec![head_entry];
+            for e in snap.entries.iter().skip(head_idx + 1) {
+                if e.head.is_none() && e.id >= target_id {
+                    slice.push(e);
+                }
+            }
+            slice
+        } else {
+            snap.entries.iter().collect()
+        };
+
+        for entry in active_entries {
+            if self.session_id.is_none() {
+                self.session_id = Some(format!("durable-{}", entry.conversation_id));
+            }
+            self.apply_entry_to_history(entry, false);
+        }
+
+        // Attach in-flight generation partial message if present
+        if let Some(ref gen) = snap.generation {
+            if let Some(ref partial_msg) = gen.message {
+                let blocks = parse_assistant_message_blocks(partial_msg, true);
+                if let Some(ref u) = partial_msg.usage {
+                    self.usage = Some(u.clone());
+                }
+                let offset = {
+                    let msg = self.ensure_streaming_assistant_message();
+                    let off = msg.blocks.len();
+                    if msg.timestamp.is_none() {
+                        msg.timestamp = partial_msg.timestamp;
+                    }
+                    msg.blocks.extend(blocks);
+                    off
+                };
+                self.current_turn_block_offset = offset;
+            }
+        }
+
+        // Overlay running/pending tool slots onto history
+        for slot in &snap.tools {
+            let is_running = slot.status == "running" || slot.status == "pending";
+            let partial = slot
+                .output
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|s| serde_json::Value::String(s.clone()));
+
+            let mut found = false;
+            self.update_tool_call_in_history(&slot.call_id, |tool| {
+                found = true;
+                tool.is_executing = is_running;
+                if partial.is_some() {
+                    tool.partial_result = partial.clone();
+                }
+            });
+
+            if !found && is_running {
+                let msg = self.ensure_streaming_assistant_message();
+                msg.blocks.push(MessageBlock::ToolCall(ToolCallData {
+                    id: slot.call_id.clone(),
+                    name: slot.name.clone(),
+                    args: serde_json::Value::Null,
+                    args_raw: String::new(),
+                    partial_result: partial,
+                    result: None,
+                    is_error: false,
+                    duration_ms: None,
+                    collapsed: true,
+                    is_executing: true,
+                }));
+            }
+        }
+
+        // Restore agent model & thinking level
+        if let Some(ref model_ref) = snap.agent.model {
+            self.model = Some(model_ref.full_id());
+        }
+        if let Some(level) = snap.agent.thinking_level {
+            self.thinking_level = Some(level);
+        }
+
+        // Restore cumulative usage
+        let total_usage = snap.usage.total_usage();
+        if total_usage.total_tokens > 0 || total_usage.input > 0 || total_usage.output > 0 {
+            self.usage = Some(total_usage);
+        }
+
+        // Restore inbox queues
+        self.apply_inbox_items(&snap.inbox);
+
+        // Determine active status
+        if let Some(running_tool) = snap.tools.iter().find(|t| t.status == "running") {
+            self.status = AgentStatus::ExecutingTool {
+                name: running_tool.name.clone(),
+                tool_call_id: running_tool.call_id.clone(),
+            };
+        } else if snap.run.is_some() || snap.generation.is_some() {
+            self.status = AgentStatus::Thinking;
+        } else if self.active_dialog_id.is_none() {
+            self.status = AgentStatus::Idle;
+        }
+    }
+
+    fn apply_inbox_items(&mut self, items: &[QueuedItem]) {
+        self.steering_queue.clear();
+        self.follow_up_queue.clear();
+        for item in items {
+            let label = item
+                .text
+                .clone()
+                .unwrap_or_else(|| format!("Queued #{}", item.id));
+            match item.mode {
+                InboxMode::Steer => self.steering_queue.push(label),
+                InboxMode::FollowUp => self.follow_up_queue.push(label),
+                InboxMode::Write => {}
+            }
+        }
+    }
+
+    fn ensure_streaming_assistant_message(&mut self) -> &mut ChatMessage {
+        let needs_new = match self.history.last() {
+            Some(msg) => msg.role != "assistant",
+            None => true,
+        };
+        if needs_new {
+            self.current_turn_block_offset = 0;
+            self.history.push(ChatMessage::assistant());
+        } else if let Some(last) = self.history.last_mut() {
+            last.is_streaming = true;
+        }
+        self.history.last_mut().unwrap()
+    }
+
+    fn apply_entry_to_history(&mut self, entry: &EntryRecord, from_live_event: bool) {
+        match entry.kind.as_str() {
+            "pi.reset" => {
+                self.history.clear();
+                self.usage = None;
+                if let Some(msg) = entry.model.as_ref().and_then(|m| m.first()) {
+                    let text = msg.text();
+                    if !text.is_empty() {
+                        let mut user_msg = ChatMessage::user(text);
+                        user_msg.timestamp = msg.timestamp;
+                        self.history.push(user_msg);
+                    }
+                } else if from_live_event {
+                    self.history
+                        .push(ChatMessage::system("**New session started.**"));
+                }
+            }
+
+            "pi.compaction" => {
+                if let Some(msg) = entry.model.as_ref().and_then(|m| m.first()) {
+                    let summary = msg.text();
+                    if !summary.is_empty() {
+                        self.history.push(ChatMessage::system(format!(
+                            "### Context Compacted\n\n{summary}"
+                        )));
+                    }
+                }
+            }
+
+            "pi.user" => {
+                if let Some(last) = self.history.last() {
+                    if last.role == "assistant" && last.blocks.is_empty() {
+                        self.history.pop();
+                    }
+                }
+                if let Some(msg) = entry.model.as_ref().and_then(|m| m.first()) {
+                    let text = msg.text();
+                    let already_exists = self
+                        .history
+                        .last()
+                        .is_some_and(|m| m.role == "user" && m.text() == text);
+                    if !already_exists && !text.is_empty() {
+                        let mut user_msg = ChatMessage::user(text);
+                        user_msg.timestamp = msg.timestamp;
+                        self.history.push(user_msg);
+                    } else if let Some(last) = self.history.last_mut() {
+                        if last.role == "user" && last.timestamp.is_none() {
+                            last.timestamp = msg.timestamp;
+                        }
+                    }
+                }
+            }
+
+            "pi.assistant" => {
+                if let Some(msg) = entry.model.as_ref().and_then(|m| m.first()) {
+                    if let Some(ref u) = msg.usage {
+                        self.usage = Some(u.clone());
+                    }
+                    if from_live_event {
+                        if let Some(err_msg) = assistant_error_message(msg) {
+                            self.status = AgentStatus::Error(err_msg.to_string());
+                        }
+                    }
+                    let parsed_blocks = parse_assistant_message_blocks(msg, false);
+
+                    if let Some(last) = self.history.last_mut() {
+                        if last.role == "assistant" {
+                            last.is_streaming = false;
+                            if last.timestamp.is_none() {
+                                last.timestamp = msg.timestamp;
+                            }
+                            if from_live_event {
+                                let offset = self.current_turn_block_offset.min(last.blocks.len());
+                                let repeats_prior = offset > 0
+                                    && last.blocks[..offset].iter().any(|b| match b {
+                                        MessageBlock::ToolCall(t) => parsed_blocks.iter().any(
+                                            |inc| matches!(inc, MessageBlock::ToolCall(it) if it.id == t.id),
+                                        ),
+                                        _ => false,
+                                    });
+                                if repeats_prior {
+                                    Self::merge_settled_blocks(&mut last.blocks, parsed_blocks);
+                                } else {
+                                    let mut turn_blocks = last.blocks.split_off(offset);
+                                    Self::merge_settled_blocks(&mut turn_blocks, parsed_blocks);
+                                    last.blocks.extend(turn_blocks);
+                                }
+                            } else {
+                                last.blocks.extend(parsed_blocks);
+                            }
+                            last.update_markdown_cache();
+                            self.current_turn_block_offset = last.blocks.len();
+                            return;
+                        }
+                    }
+
+                    let mut chat_msg = ChatMessage::assistant();
+                    chat_msg.is_streaming = false;
+                    chat_msg.timestamp = msg.timestamp;
+                    chat_msg.blocks = parsed_blocks;
+                    chat_msg.update_markdown_cache();
+                    self.current_turn_block_offset = chat_msg.blocks.len();
+                    if !chat_msg.blocks.is_empty() {
+                        self.history.push(chat_msg);
+                    }
+                }
+            }
+
+            "pi.tool-result" => {
+                if let Some(msg) = entry.model.as_ref().and_then(|m| m.first()) {
+                    if let Some(ref call_id) = msg.tool_call_id {
+                        let text = msg.text();
+                        let res_val = if !text.is_empty() {
+                            Some(serde_json::Value::String(text))
+                        } else if !msg.content.is_null() {
+                            Some(msg.content.clone())
+                        } else {
+                            None
+                        };
+                        let is_err = msg.is_error.unwrap_or(false);
+                        let dur = msg.duration_ms;
+
+                        self.update_tool_call_in_history(call_id, |tool| {
+                            if res_val.is_some() {
+                                tool.result = res_val;
+                            }
+                            tool.is_error = is_err;
+                            if dur.is_some() {
+                                tool.duration_ms = dur;
+                            }
+                            tool.is_executing = false;
+                        });
+                    }
+                }
+            }
+
+            _ => {
+                if let Some(msg) = entry.model.as_ref().and_then(|m| m.first()) {
+                    if msg.role == "user" {
+                        let text = msg.text();
+                        if !text.is_empty() {
+                            self.history.push(ChatMessage::user(text));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn merge_settled_blocks(existing: &mut Vec<MessageBlock>, incoming: Vec<MessageBlock>) {
+        if incoming.is_empty() {
+            for b in existing.iter_mut() {
+                if let MessageBlock::Thinking { is_streaming, .. } = b {
+                    *is_streaming = false;
+                }
+            }
+            return;
+        }
+
+        if existing.is_empty() {
+            *existing = incoming;
+            return;
+        }
+
+        // If existing blocks already contain settled tool calls from an earlier turn of the same
+        // run that are not repeated in `incoming` (e.g. a post-tool generation turn that only
+        // carries the final text block), keep those earlier blocks in front and merge/replace the
+        // tail blocks of the current turn.
+        let incoming_has_all_tools = existing.iter().all(|b| match b {
+            MessageBlock::ToolCall(t) => incoming
+                .iter()
+                .any(|inc| matches!(inc, MessageBlock::ToolCall(it) if it.id == t.id)),
+            _ => true,
+        });
+
+        if !incoming_has_all_tools {
+            // Finalize any streaming blocks at the tail
+            for b in existing.iter_mut() {
+                if let MessageBlock::Thinking { is_streaming, .. } = b {
+                    *is_streaming = false;
+                }
+            }
+            for inc in incoming {
+                match inc {
+                    MessageBlock::Text { ref text, .. } => {
+                        if let Some(MessageBlock::Text {
+                            text: ex_text,
+                            parsed: ex_parsed,
+                        }) = existing
+                            .iter_mut()
+                            .rev()
+                            .find(|b| matches!(b, MessageBlock::Text { .. }))
+                        {
+                            if ex_text == text || text.starts_with(ex_text.as_str()) {
+                                *ex_text = text.clone();
+                                *ex_parsed = cosmic::iced::widget::markdown::parse(text).collect();
+                                continue;
+                            }
+                        }
+                        existing.push(inc);
+                    }
+                    MessageBlock::ToolCall(ref inc_tool) => {
+                        if !existing.iter().any(
+                            |b| matches!(b, MessageBlock::ToolCall(t) if t.id == inc_tool.id),
+                        ) {
+                            existing.push(inc);
+                        }
+                    }
+                    MessageBlock::Thinking { ref text, .. } => {
+                        if !existing
+                            .iter()
+                            .any(|b| matches!(b, MessageBlock::Thinking { text: t, .. } if t == text))
+                        {
+                            existing.push(inc);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Preserve collapse state and tool execution results from existing blocks
+        let mut merged = Vec::with_capacity(incoming.len());
+        for mut inc in incoming {
+            match &mut inc {
+                MessageBlock::Thinking { collapsed, .. } => {
+                    if let Some(MessageBlock::Thinking {
+                        collapsed: prev_col,
+                        ..
+                    }) = existing
+                        .iter()
+                        .find(|b| matches!(b, MessageBlock::Thinking { .. }))
+                    {
+                        *collapsed = *prev_col;
+                    }
+                }
+                MessageBlock::ToolCall(inc_tool) => {
+                    if let Some(MessageBlock::ToolCall(prev_tool)) = existing.iter().find(|b| {
+                        matches!(b, MessageBlock::ToolCall(t) if t.id == inc_tool.id)
+                    }) {
+                        inc_tool.collapsed = prev_tool.collapsed;
+                        inc_tool.partial_result = prev_tool.partial_result.clone();
+                        if inc_tool.result.is_none() {
+                            inc_tool.result = prev_tool.result.clone();
+                            inc_tool.is_error = prev_tool.is_error;
+                            inc_tool.duration_ms = prev_tool.duration_ms;
+                        }
+                        inc_tool.is_executing = prev_tool.is_executing;
+                    }
+                }
+                MessageBlock::Text { .. } => {}
+            }
+            merged.push(inc);
+        }
+        *existing = merged;
+    }
+
     /// Internal helper to update state from incoming `PiEvent`s.
     fn handle_event(&mut self, event: PiEvent) {
         match event {
-            PiEvent::AgentStart => {
+            PiEvent::Snapshot(snap) => {
+                self.hydrate_from_snapshot(snap);
+            }
+
+            PiEvent::RunStart { .. } => {
                 self.status = AgentStatus::Thinking;
             }
 
-            PiEvent::AgentSettled { aborted } => {
-                self.status = AgentStatus::Idle;
+            PiEvent::RunEnd { .. } => {
+                if !matches!(self.status, AgentStatus::Error(_)) {
+                    self.status = AgentStatus::Idle;
+                }
                 for msg in &mut self.history {
                     if msg.is_streaming {
                         msg.is_streaming = false;
                         msg.update_markdown_cache();
                     }
                 }
-                // Drop any trailing empty assistant turn
                 if let Some(last) = self.history.last() {
                     if last.role == "assistant" && last.blocks.is_empty() {
                         self.history.pop();
-                    }
-                }
-                if aborted {
-                    tracing::info!("Agent run was aborted");
-                }
-            }
-
-            PiEvent::AgentEnd { will_retry, .. } => {
-                if !will_retry {
-                    for msg in &mut self.history {
-                        if msg.is_streaming {
-                            msg.is_streaming = false;
-                            msg.update_markdown_cache();
-                        }
-                    }
-                    if let Some(last) = self.history.last() {
-                        if last.role == "assistant" && last.blocks.is_empty() {
-                            self.history.pop();
-                        }
                     }
                 }
             }
 
             PiEvent::TurnStart => {
-                let needs_new = match self.history.last() {
-                    Some(msg) => msg.role != "assistant" || !msg.is_streaming,
-                    None => true,
-                };
-                if needs_new {
-                    self.history.push(ChatMessage::assistant());
-                }
+                self.status = AgentStatus::Thinking;
+                let offset = self.ensure_streaming_assistant_message().blocks.len();
+                self.current_turn_block_offset = offset;
             }
 
-            PiEvent::TurnEnd { .. } => {
+            PiEvent::TurnEnd => {
                 if let Some(last) = self.history.last_mut() {
+                    for b in &mut last.blocks {
+                        if let MessageBlock::Thinking { is_streaming, .. } = b {
+                            *is_streaming = false;
+                        }
+                    }
                     last.is_streaming = false;
                     last.update_markdown_cache();
+                    self.current_turn_block_offset = last.blocks.len();
                 }
-                // Drop empty assistant turns (0 blocks)
                 if let Some(last) = self.history.last() {
                     if last.role == "assistant" && last.blocks.is_empty() {
                         self.history.pop();
+                        self.current_turn_block_offset = 0;
                     }
                 }
             }
 
             PiEvent::MessageStart { message } => {
                 if message.role == "assistant" {
-                    let needs_new = match self.history.last() {
-                        Some(msg) => msg.role != "assistant" || !msg.is_streaming,
-                        None => true,
-                    };
-                    if needs_new {
-                        let mut msg = ChatMessage::assistant();
-                        msg.timestamp = message.timestamp;
-                        self.history.push(msg);
-                    } else if let Some(last) = self.history.last_mut() {
-                        if last.timestamp.is_none() {
-                            last.timestamp = message.timestamp;
+                    if let Some(ref u) = message.usage {
+                        self.usage = Some(u.clone());
+                    }
+                    if let Some(err_msg) = assistant_error_message(&message) {
+                        self.status = AgentStatus::Error(err_msg.to_string());
+                    }
+                    let initial_blocks = parse_assistant_message_blocks(&message, true);
+                    let _ = self.ensure_streaming_assistant_message();
+                    let cur_offset = self.current_turn_block_offset;
+                    if let Some(msg) = self.history.last_mut() {
+                        if msg.timestamp.is_none() {
+                            msg.timestamp = message.timestamp;
+                        }
+                        let offset = cur_offset.min(msg.blocks.len());
+                        if !initial_blocks.is_empty() {
+                            msg.blocks.truncate(offset);
+                            msg.blocks.extend(initial_blocks);
                         }
                     }
                 } else if message.role == "user" {
-                    // If an empty assistant message was preemptively pushed by TurnStart, remove it
                     if let Some(last) = self.history.last() {
                         if last.role == "assistant" && last.blocks.is_empty() {
                             self.history.pop();
                         }
                     }
+                    self.current_turn_block_offset = 0;
 
                     let text = message.text();
-                    let already_exists = self.history.last().is_some_and(|m| {
-                        m.role == "user" && m.text() == text
-                    });
+                    let already_exists = self
+                        .history
+                        .last()
+                        .is_some_and(|m| m.role == "user" && m.text() == text);
                     if !already_exists && !text.is_empty() {
                         let mut user_msg = ChatMessage::user(text);
                         user_msg.timestamp = message.timestamp;
@@ -1185,73 +1750,98 @@ impl PiSessionController {
                 }
             }
 
-            PiEvent::MessageUpdate {
-                usage,
-                assistant_message_event,
-            } => {
+            PiEvent::MessageUpdate { usage, changes } => {
                 if let Some(u) = usage {
                     self.usage = Some(u);
                 }
-                self.handle_assistant_message_event(assistant_message_event);
+                for change in changes {
+                    self.apply_message_change(change);
+                }
             }
 
-            PiEvent::MessageEnd { message } => {
-                if message.role == "assistant" {
-                    if let Some(last) = self.history.last_mut() {
-                        if last.role == "assistant" {
-                            last.is_streaming = false;
-                            last.timestamp = message.timestamp;
-                            last.update_markdown_cache();
-                        }
-                    }
-                } else if message.role == "user" {
-                    if let Some(last) = self.history.last_mut() {
-                        if last.role == "user" && last.timestamp.is_none() {
-                            last.timestamp = message.timestamp;
-                        }
-                    }
-                }
+            PiEvent::MessageEnd { entry } => {
+                self.apply_entry_to_history(&entry, true);
             }
 
             PiEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
                 args,
+                ..
             } => {
                 self.status = AgentStatus::ExecutingTool {
                     name: tool_name.clone(),
                     tool_call_id: tool_call_id.clone(),
                 };
+                let mut found = false;
+                let args_clone = args.clone();
                 self.update_tool_call_in_history(&tool_call_id, |tool| {
+                    found = true;
                     tool.is_executing = true;
-                    if !args.is_null() {
-                        tool.args = args;
+                    if !args_clone.is_null() {
+                        tool.args = args_clone;
                     }
                 });
+                if !found {
+                    let msg = self.ensure_streaming_assistant_message();
+                    let args_raw = if args.is_null() {
+                        String::new()
+                    } else {
+                        serde_json::to_string(&args).unwrap_or_default()
+                    };
+                    msg.blocks.push(MessageBlock::ToolCall(ToolCallData {
+                        id: tool_call_id,
+                        name: tool_name,
+                        args,
+                        args_raw,
+                        partial_result: None,
+                        result: None,
+                        is_error: false,
+                        duration_ms: None,
+                        collapsed: true,
+                        is_executing: true,
+                    }));
+                }
             }
 
             PiEvent::ToolExecutionUpdate {
                 tool_call_id,
-                partial_result,
+                output,
                 ..
             } => {
-                self.update_tool_call_in_history(&tool_call_id, |tool| {
-                    tool.partial_result = partial_result;
-                });
+                if let Some(out) = output {
+                    self.update_tool_call_in_history(&tool_call_id, |tool| {
+                        apply_tool_output_update(&mut tool.partial_result, &out);
+                    });
+                }
             }
 
             PiEvent::ToolExecutionEnd {
                 tool_call_id,
+                entry,
                 result,
-                is_error,
-                duration_ms,
                 ..
             } => {
                 self.update_tool_call_in_history(&tool_call_id, |tool| {
-                    tool.result = result;
-                    tool.is_error = is_error;
-                    tool.duration_ms = duration_ms;
                     tool.is_executing = false;
+                    if let Some(ref entry_rec) = entry {
+                        if let Some(msg) = entry_rec.model.as_ref().and_then(|m| m.first()) {
+                            let text = msg.text();
+                            if !text.is_empty() {
+                                tool.result = Some(serde_json::Value::String(text));
+                            } else if !msg.content.is_null() {
+                                tool.result = Some(msg.content.clone());
+                            }
+                            tool.is_error = msg.is_error.unwrap_or(false);
+                            if msg.duration_ms.is_some() {
+                                tool.duration_ms = msg.duration_ms;
+                            }
+                        }
+                    } else if let Some(ref nested) = result {
+                        tool.result = nested.structured_output.clone();
+                        tool.is_error = nested.is_error;
+                        tool.duration_ms = nested.duration_ms;
+                    }
                 });
 
                 if let AgentStatus::ExecutingTool {
@@ -1265,51 +1855,82 @@ impl PiSessionController {
                 }
             }
 
-            PiEvent::SessionInfoChanged { name } => {
-                self.session_name = name;
+            PiEvent::InboxUpdate { items } => {
+                self.apply_inbox_items(&items);
             }
 
-            PiEvent::ThinkingLevelChanged { level } => {
-                self.thinking_level = Some(level);
+            PiEvent::Submission { record } => {
+                if record.status == "unanswered" {
+                    if let Some(ref detail) = record.detail {
+                        if !detail.is_empty() {
+                            self.status = AgentStatus::Error(detail.clone());
+                            let already_shown = self
+                                .history
+                                .last()
+                                .is_some_and(|m| m.text().contains(detail.as_str()));
+                            if !already_shown {
+                                self.history
+                                    .push(ChatMessage::system(format!("⚠️ **Error:** {detail}")));
+                            }
+                        }
+                    }
+                }
             }
 
-            PiEvent::QueueUpdate {
-                steering,
-                follow_up,
-            } => {
-                self.steering_queue = steering;
-                self.follow_up_queue = follow_up;
+            PiEvent::EntryAppended { entry } => {
+                self.apply_entry_to_history(&entry, true);
+            }
+
+            PiEvent::AgentChanged { agent } => {
+                if let Some(ref m) = agent.model {
+                    self.model = Some(m.full_id());
+                }
+                if let Some(lvl) = agent.thinking_level {
+                    self.thinking_level = Some(lvl);
+                }
+            }
+
+            PiEvent::UsageChanged { usage } => {
+                self.usage = Some(usage.total_usage());
+            }
+
+            PiEvent::TaskFailed { message, .. } => {
+                self.status = AgentStatus::Error(message.clone());
+                self.history
+                    .push(ChatMessage::system(format!("**Error**: {message}")));
             }
 
             _ => {}
         }
     }
 
-    /// Updates or appends streaming assistant content.
-    fn handle_assistant_message_event(&mut self, event: AssistantMessageEvent) {
-        let msg = match self.history.last_mut() {
-            Some(m) if m.role == "assistant" => m,
-            _ => {
-                self.history.push(ChatMessage::assistant());
-                self.history.last_mut().unwrap()
-            }
-        };
+    /// Applies one `MessageChange` delta to the in-flight assistant message.
+    fn apply_message_change(&mut self, change: MessageChange) {
+        if matches!(
+            change,
+            MessageChange::ThinkingStart { .. } | MessageChange::ThinkingDelta { .. }
+        ) {
+            self.status = AgentStatus::Thinking;
+        }
 
-        match event {
-            AssistantMessageEvent::Start => {
-                self.status = AgentStatus::Thinking;
-            }
+        let msg = self.ensure_streaming_assistant_message();
 
-            AssistantMessageEvent::ThinkingStart { .. } => {
-                self.status = AgentStatus::Thinking;
+        match change {
+            MessageChange::ThinkingStart { block, .. } => {
+                let initial = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 msg.blocks.push(MessageBlock::Thinking {
-                    text: String::new(),
+                    text: initial,
                     collapsed: true,
                     is_streaming: true,
                 });
             }
 
-            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+            MessageChange::ThinkingDelta { delta, .. } => {
                 let has_thinking = msg
                     .blocks
                     .iter()
@@ -1329,23 +1950,24 @@ impl PiSessionController {
                 }
             }
 
-            AssistantMessageEvent::ThinkingEnd { .. } => {
-                for block in msg.blocks.iter_mut().rev() {
-                    if let MessageBlock::Thinking { is_streaming, .. } = block {
+            MessageChange::TextStart { block, .. } => {
+                for b in msg.blocks.iter_mut() {
+                    if let MessageBlock::Thinking { is_streaming, .. } = b {
                         *is_streaming = false;
-                        break;
                     }
                 }
-            }
-
-            AssistantMessageEvent::TextStart { .. } => {
+                let initial = block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 msg.blocks.push(MessageBlock::Text {
-                    text: String::new(),
+                    text: initial,
                     parsed: Vec::new(),
                 });
             }
 
-            AssistantMessageEvent::TextDelta { delta, .. } => {
+            MessageChange::TextDelta { delta, .. } => {
                 let has_text = msg
                     .blocks
                     .iter()
@@ -1364,21 +1986,33 @@ impl PiSessionController {
                 }
             }
 
-            AssistantMessageEvent::TextEnd { .. } => {
-                for block in msg.blocks.iter_mut().rev() {
-                    if let MessageBlock::Text { text, parsed } = block {
-                        *parsed = cosmic::iced::widget::markdown::parse(text).collect();
-                        break;
-                    }
-                }
-            }
-
-            AssistantMessageEvent::ToolcallStart { id, tool_name, .. } => {
+            MessageChange::ToolcallStart { block, .. } => {
+                let id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .or_else(|| block.get("toolName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                let args = block
+                    .get("arguments")
+                    .or_else(|| block.get("args"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let args_raw = if args.is_null() {
+                    String::new()
+                } else {
+                    serde_json::to_string(&args).unwrap_or_default()
+                };
                 msg.blocks.push(MessageBlock::ToolCall(ToolCallData {
                     id,
-                    name: tool_name,
-                    args: serde_json::Value::Null,
-                    args_raw: String::new(),
+                    name,
+                    args,
+                    args_raw,
                     partial_result: None,
                     result: None,
                     is_error: false,
@@ -1388,37 +2022,65 @@ impl PiSessionController {
                 }));
             }
 
-            AssistantMessageEvent::ToolcallDelta { delta, .. } => {
+            MessageChange::ToolcallDelta { path, delta, .. } => {
                 for block in msg.blocks.iter_mut().rev() {
                     if let MessageBlock::ToolCall(tool) = block {
-                        tool.args_raw.push_str(&delta);
-                        if let Ok(parsed) =
-                            serde_json::from_str::<serde_json::Value>(&tool.args_raw)
-                        {
-                            tool.args = parsed;
+                        if let Some(first_key) = path.first().and_then(|v| v.as_str()) {
+                            if !tool.args.is_object() {
+                                tool.args = serde_json::json!({});
+                            }
+                            if let Some(obj) = tool.args.as_object_mut() {
+                                let entry = obj
+                                    .entry(first_key.to_string())
+                                    .or_insert_with(|| serde_json::Value::String(String::new()));
+                                if let Some(existing_str) = entry.as_str() {
+                                    let mut updated = existing_str.to_string();
+                                    updated.push_str(&delta);
+                                    *entry = serde_json::Value::String(updated);
+                                }
+                            }
+                        } else {
+                            tool.args_raw.push_str(&delta);
+                            if let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(&tool.args_raw)
+                            {
+                                tool.args = parsed;
+                            }
                         }
                         break;
                     }
                 }
             }
 
-            AssistantMessageEvent::ToolcallEnd { tool_call, .. } => {
-                for block in msg.blocks.iter_mut().rev() {
-                    if let MessageBlock::ToolCall(tool) = block {
-                        tool.args = tool_call;
-                        break;
+            MessageChange::Block {
+                content_index,
+                block,
+            } => {
+                let _ = self.ensure_streaming_assistant_message();
+                let offset = self.current_turn_block_offset;
+                if let Some(parsed_block) = parse_single_content_block(&block, true) {
+                    if let Some(msg) = self.history.last_mut() {
+                        let target_idx = offset + content_index;
+                        if target_idx < msg.blocks.len() {
+                            msg.blocks[target_idx] = parsed_block;
+                        } else {
+                            msg.blocks.push(parsed_block);
+                        }
                     }
                 }
             }
 
-            AssistantMessageEvent::Done { .. } => {
-                msg.is_streaming = false;
-                msg.update_markdown_cache();
-            }
-
-            AssistantMessageEvent::Error { error, .. } => {
-                msg.is_streaming = false;
-                self.status = AgentStatus::Error(error);
+            MessageChange::Message {
+                message: full_message,
+            } => {
+                let new_blocks = parse_assistant_message_blocks(&full_message, true);
+                let _ = self.ensure_streaming_assistant_message();
+                let offset = self.current_turn_block_offset;
+                if let Some(msg) = self.history.last_mut() {
+                    let trunc_len = offset.min(msg.blocks.len());
+                    msg.blocks.truncate(trunc_len);
+                    msg.blocks.extend(new_blocks);
+                }
             }
         }
     }
@@ -1558,4 +2220,40 @@ impl PiSessionController {
     pub fn view_status_badge(&self) -> Element<'_, PiAction> {
         StatusBadge::view(&self.status)
     }
+}
+
+fn apply_tool_output_update(
+    partial_result: &mut Option<serde_json::Value>,
+    update: &ToolOutputUpdate,
+) {
+    if let Some(ref set_text) = update.set {
+        *partial_result = Some(serde_json::Value::String(set_text.clone()));
+        return;
+    }
+
+    let mut current = partial_result
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if let Some(trim) = update.trim_start {
+        if trim >= current.len() {
+            current.clear();
+        } else {
+            // Drain up to `trim` UTF-8 characters / bytes safely
+            let byte_idx = current
+                .char_indices()
+                .nth(trim)
+                .map(|(i, _)| i)
+                .unwrap_or(current.len());
+            current.drain(..byte_idx);
+        }
+    }
+
+    if let Some(ref append_text) = update.append {
+        current.push_str(append_text);
+    }
+
+    *partial_result = Some(serde_json::Value::String(current));
 }

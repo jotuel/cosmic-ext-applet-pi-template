@@ -14,19 +14,20 @@ use crate::transport::{JsonLinesReader, JsonLinesWriter};
 pub type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin + 'static>;
 pub type BoxedReader = Box<dyn AsyncRead + Send + Unpin + 'static>;
 
-/// Asynchronous client for interacting with Pi in RPC mode.
+/// Asynchronous client for interacting with Pi Durable over JSONL RPC.
 #[derive(Clone)]
 pub struct PiClient {
     writer: Arc<tokio::sync::Mutex<Option<JsonLinesWriter<BoxedWriter>>>>,
     pending_commands: Arc<Mutex<HashMap<String, oneshot::Sender<RawCommandResponse>>>>,
     event_tx: broadcast::Sender<PiEvent>,
+    latest_snapshot: Arc<Mutex<Option<SnapshotEvent>>>,
     ui_subscribers: Arc<Mutex<Vec<mpsc::Sender<ExtensionUiRequest>>>>,
     process: Arc<tokio::sync::Mutex<Option<PiProcess>>>,
     recent_stderr: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl PiClient {
-    /// Launches a `pi --mode rpc` child process and starts JSONL protocol framing.
+    /// Launches a Pi Durable child process and starts JSONL protocol framing.
     pub async fn spawn(config: PiProcessConfig) -> Result<Self, PiError> {
         let (child_stdin, child_stdout, proc) = PiProcess::spawn(&config)?;
         Ok(Self::from_io(
@@ -47,6 +48,7 @@ impl PiClient {
         let pending_commands: Arc<Mutex<HashMap<String, oneshot::Sender<RawCommandResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel(2048);
+        let latest_snapshot: Arc<Mutex<Option<SnapshotEvent>>> = Arc::new(Mutex::new(None));
         let ui_subscribers: Arc<Mutex<Vec<mpsc::Sender<ExtensionUiRequest>>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -54,6 +56,7 @@ impl PiClient {
 
         let pending_clone = Arc::clone(&pending_commands);
         let event_tx_clone = event_tx.clone();
+        let latest_snapshot_clone = Arc::clone(&latest_snapshot);
         let ui_subs_clone = Arc::clone(&ui_subscribers);
 
         tokio::spawn(async move {
@@ -89,6 +92,11 @@ impl PiClient {
                             });
                         }
                         IncomingRecord::Event(event) => {
+                            if let PiEvent::Snapshot(ref snap) = event {
+                                if let Ok(mut guard) = latest_snapshot_clone.lock() {
+                                    *guard = Some(snap.clone());
+                                }
+                            }
                             let _ = event_tx_clone.send(event);
                         }
                     },
@@ -113,10 +121,19 @@ impl PiClient {
             writer,
             pending_commands,
             event_tx,
+            latest_snapshot,
             ui_subscribers,
             process: Arc::new(tokio::sync::Mutex::new(process)),
             recent_stderr,
         }
+    }
+
+    /// Returns the most recently received `SnapshotEvent` from the Pi Durable stream, if any.
+    pub fn latest_snapshot(&self) -> Option<SnapshotEvent> {
+        self.latest_snapshot
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Internal command dispatcher with request correlation.
@@ -204,20 +221,26 @@ impl PiClient {
 
     // ---------------- High-Level Command APIs ----------------
 
-    /// Sends a prompt to Pi.
-    pub async fn prompt(&self, prompt: impl Into<PromptRequest>) -> Result<PromptDisposition, PiError> {
+    /// Durably submits user input to the conversation.
+    pub async fn submit(&self, prompt: impl Into<PromptRequest>) -> Result<PromptData, PiError> {
         let req = prompt.into();
-        let cmd = RpcCommand::Prompt {
+        let cmd = RpcCommand::Submit {
             id: None,
             message: req.message,
             images: req.images,
-            streaming_behavior: req.streaming_behavior,
+            when_busy: req.streaming_behavior,
+            request_id: req.request_id,
         };
-        let data: PromptData = self.execute_command(cmd).await?;
+        self.execute_command(cmd).await
+    }
+
+    /// Sends a prompt to Pi Durable and returns its disposition.
+    pub async fn prompt(&self, prompt: impl Into<PromptRequest>) -> Result<PromptDisposition, PiError> {
+        let data = self.submit(prompt).await?;
         Ok(data.disposition)
     }
 
-    /// Out-of-band steering message delivered after current assistant turn.
+    /// Out-of-band steering message delivered after the current tool round.
     pub async fn steer(&self, message: impl Into<String>) -> Result<QueuedInputDisposition, PiError> {
         self.steer_with_images(message, Vec::new()).await
     }
@@ -237,7 +260,7 @@ impl PiClient {
         Ok(data.disposition)
     }
 
-    /// Queue follow-up message to execute when current turns settle.
+    /// Queue follow-up message to execute when the current run answers.
     pub async fn follow_up(&self, message: impl Into<String>) -> Result<QueuedInputDisposition, PiError> {
         self.follow_up_with_images(message, Vec::new()).await
     }
@@ -257,7 +280,7 @@ impl PiClient {
         Ok(data.disposition)
     }
 
-    /// Abort current agent activity and wait for session to become idle.
+    /// Abort current agent activity and withdraw queued inputs.
     pub async fn abort(&self) -> Result<(), PiError> {
         let cmd = RpcCommand::Abort { id: None };
         self.execute_command(cmd).await
@@ -269,14 +292,34 @@ impl PiClient {
         self.execute_command(cmd).await
     }
 
-    /// Reset or start a new session.
-    pub async fn new_session(&self, parent_session: Option<String>) -> Result<bool, PiError> {
-        let cmd = RpcCommand::NewSession {
-            id: None,
-            parent_session,
-        };
+    /// Append a `pi.reset` entry starting a fresh active context.
+    pub async fn reset(&self, handoff: Option<String>) -> Result<bool, PiError> {
+        let cmd = RpcCommand::Reset { id: None, handoff };
         let data: SessionCancelledData = self.execute_command(cmd).await?;
         Ok(data.cancelled)
+    }
+
+    /// Reset or start a new session context (`reset` alias).
+    pub async fn new_session(&self, handoff: Option<String>) -> Result<bool, PiError> {
+        self.reset(handoff).await
+    }
+
+    /// Configure conversation `pi.agent` choices (`model`, `thinkingLevel`, `cwd`, `instructions`).
+    pub async fn configure(
+        &self,
+        model: Option<ModelRef>,
+        thinking_level: Option<ThinkingLevel>,
+        cwd: Option<String>,
+        instructions: Option<String>,
+    ) -> Result<RpcSessionState, PiError> {
+        let cmd = RpcCommand::Configure {
+            id: None,
+            model,
+            thinking_level,
+            cwd,
+            instructions,
+        };
+        self.execute_command(cmd).await
     }
 
     /// Query current session state, model, thinking level, and flags.
@@ -385,66 +428,10 @@ impl PiClient {
         self.execute_command(cmd).await
     }
 
-    /// Abort an ongoing direct bash execution.
-    pub async fn abort_bash(&self) -> Result<(), PiError> {
-        let cmd = RpcCommand::AbortBash { id: None };
-        self.execute_command(cmd).await
-    }
-
     /// Retrieve token usage and session statistics.
     pub async fn get_session_stats(&self) -> Result<SessionStats, PiError> {
         let cmd = RpcCommand::GetSessionStats { id: None };
         self.execute_command(cmd).await
-    }
-
-    /// Export the current session to HTML.
-    pub async fn export_html(&self, output_path: Option<String>) -> Result<String, PiError> {
-        let cmd = RpcCommand::ExportHtml {
-            id: None,
-            output_path,
-        };
-        let data: ExportHtmlData = self.execute_command(cmd).await?;
-        Ok(data.path)
-    }
-
-    /// Switch to a different session file.
-    pub async fn switch_session(&self, session_path: impl Into<String>) -> Result<bool, PiError> {
-        let cmd = RpcCommand::SwitchSession {
-            id: None,
-            session_path: session_path.into(),
-        };
-        let data: SessionCancelledData = self.execute_command(cmd).await?;
-        Ok(data.cancelled)
-    }
-
-    /// Fork session from a specific entry ID.
-    pub async fn fork(&self, entry_id: impl Into<String>) -> Result<ForkData, PiError> {
-        let cmd = RpcCommand::Fork {
-            id: None,
-            entry_id: entry_id.into(),
-        };
-        self.execute_command(cmd).await
-    }
-
-    /// Clone the current session into a new session file.
-    pub async fn clone_session(&self) -> Result<bool, PiError> {
-        let cmd = RpcCommand::CloneSession { id: None };
-        let data: SessionCancelledData = self.execute_command(cmd).await?;
-        Ok(data.cancelled)
-    }
-
-    /// Retrieve messages available for forking.
-    pub async fn get_fork_messages(&self) -> Result<Vec<ForkMessage>, PiError> {
-        let cmd = RpcCommand::GetForkMessages { id: None };
-        let data: ForkMessagesData = self.execute_command(cmd).await?;
-        Ok(data.messages)
-    }
-
-    /// Retrieve the text of the last assistant turn.
-    pub async fn get_last_assistant_text(&self) -> Result<Option<String>, PiError> {
-        let cmd = RpcCommand::GetLastAssistantText { id: None };
-        let data: LastAssistantTextData = self.execute_command(cmd).await?;
-        Ok(data.text)
     }
 
     /// Set session display name.

@@ -6,70 +6,91 @@ use serde_json::json;
 use tokio::io::duplex;
 
 #[tokio::test]
-async fn test_client_prompt_and_events() {
+async fn test_client_prompt_and_durable_events() {
     let (client_stdin, mut server_stdin) = duplex(4096);
     let (mut server_stdout, client_stdout) = duplex(4096);
 
     let client = PiClient::from_io(Box::new(client_stdin), Box::new(client_stdout), None);
     let mut event_rx = client.subscribe_events();
 
-    // Spawn server simulator task
     let server_handle = tokio::spawn(async move {
         let mut reader = JsonLinesReader::new(&mut server_stdin);
         let mut writer = JsonLinesWriter::new(&mut server_stdout);
 
-        // 1. Expect prompt command
+        // 1. Emit initial snapshot
+        let snapshot_event = json!({
+            "type": "snapshot",
+            "entries": [],
+            "tools": [],
+            "nestedTools": [],
+            "compactions": [],
+            "inbox": [],
+            "agent": {
+                "model": { "provider": "radius", "modelId": "balanced" },
+                "thinkingLevel": "medium"
+            },
+            "usage": { "models": {}, "tools": {} }
+        });
+        writer.write_record(&snapshot_event).await.unwrap();
+
+        // 2. Expect submit command
         let cmd: RpcCommand = reader.read_record().await.unwrap().unwrap();
         let cmd_id = cmd.id().unwrap().to_string();
 
-        if let RpcCommand::Prompt { message, .. } = cmd {
+        if let RpcCommand::Submit { message, .. } = cmd {
             assert_eq!(message, "Write a test");
         } else {
-            panic!("Expected prompt command");
+            panic!("Expected submit command");
         }
 
-        // 2. Send prompt response
+        // 3. Send submit response
         let resp = json!({
             "id": cmd_id,
             "type": "response",
-            "command": "prompt",
+            "command": "submit",
             "success": true,
             "data": {
-                "disposition": "started"
+                "disposition": "started",
+                "submissionId": 1,
+                "status": "placed"
             }
         });
         writer.write_record(&resp).await.unwrap();
 
-        // 3. Stream a text_delta event
+        // 4. Stream a message_update event with MessageChange::TextDelta
         let delta_event = json!({
             "type": "message_update",
-            "assistantMessageEvent": {
-                "type": "text_delta",
-                "contentIndex": 0,
-                "delta": "Writing test..."
-            }
+            "changes": [
+                {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": "Writing test..."
+                }
+            ]
         });
         writer.write_record(&delta_event).await.unwrap();
 
-        // 4. Stream agent_settled event
-        let settled_event = json!({
-            "type": "agent_settled",
-            "aborted": false
+        // 5. Stream run_end event
+        let run_end_event = json!({
+            "type": "run_end",
+            "inputs": [1]
         });
-        writer.write_record(&settled_event).await.unwrap();
+        writer.write_record(&run_end_event).await.unwrap();
     });
 
     let disposition = client.prompt("Write a test").await.unwrap();
     assert_eq!(disposition, PromptDisposition::Started);
 
-    // Verify first event received
+    // Verify snapshot received and cached on client
+    let event0 = event_rx.recv().await.unwrap();
+    assert!(matches!(event0, PiEvent::Snapshot(_)));
+    assert!(client.latest_snapshot().is_some());
+
+    // Verify message_update received
     let event1 = event_rx.recv().await.unwrap();
-    if let PiEvent::MessageUpdate {
-        assistant_message_event,
-        ..
-    } = event1
-    {
-        if let AssistantMessageEvent::TextDelta { delta, .. } = assistant_message_event {
+    if let PiEvent::MessageUpdate { changes, .. } = event1 {
+        assert_eq!(changes.len(), 1);
+        if let MessageChange::TextDelta { delta, .. } = &changes[0] {
             assert_eq!(delta, "Writing test...");
         } else {
             panic!("Expected text delta");
@@ -78,9 +99,9 @@ async fn test_client_prompt_and_events() {
         panic!("Expected MessageUpdate");
     }
 
-    // Verify second event received
+    // Verify run_end received
     let event2 = event_rx.recv().await.unwrap();
-    assert_eq!(event2, PiEvent::AgentSettled { aborted: false });
+    assert_eq!(event2, PiEvent::RunEnd { inputs: vec![1] });
 
     server_handle.await.unwrap();
 }
@@ -128,7 +149,7 @@ async fn test_client_correlation_out_of_order() {
                 "isCompacting": false,
                 "steeringMode": "all",
                 "followUpMode": "all",
-                "sessionId": "ses-abc",
+                "sessionId": "durable-1",
                 "autoCompactionEnabled": false,
                 "messageCount": 0,
                 "pendingMessageCount": 0
@@ -147,7 +168,7 @@ async fn test_client_correlation_out_of_order() {
     let state = res1.unwrap().unwrap();
     let commands = res2.unwrap().unwrap();
 
-    assert_eq!(state.session_id, "ses-abc");
+    assert_eq!(state.session_id, "durable-1");
     assert_eq!(state.thinking_level, ThinkingLevel::High);
 
     assert_eq!(commands.len(), 1);
@@ -208,7 +229,6 @@ async fn test_client_extension_ui_dialog_and_response() {
         let mut reader = JsonLinesReader::new(&mut server_stdin);
         let mut writer = JsonLinesWriter::new(&mut server_stdout);
 
-        // 1. Server emits extension UI select request
         let req = json!({
             "type": "extension_ui_request",
             "id": "ui-dialog-42",
@@ -218,9 +238,8 @@ async fn test_client_extension_ui_dialog_and_response() {
         });
         writer.write_record(&req).await.unwrap();
 
-        // 2. Server expects client extension UI response
         let resp: ExtensionUiResponse = reader.read_record().await.unwrap().unwrap();
-        assert_eq!(resp.id, "ui-dialog-42");
+        assert_eq!(response_id(&resp), "ui-dialog-42");
         assert_eq!(
             resp.payload,
             ExtensionUiResponsePayload::Value {
@@ -229,16 +248,18 @@ async fn test_client_extension_ui_dialog_and_response() {
         );
     });
 
-    // Client receives dialog
     let req = ui_rx.recv().await.unwrap();
     assert_eq!(req.id(), Some("ui-dialog-42"));
     assert!(req.is_dialog());
 
-    // Client answers dialog
     client
         .respond_ui(ExtensionUiResponse::value("ui-dialog-42", "Proceed"))
         .await
         .unwrap();
 
     server_handle.await.unwrap();
+}
+
+fn response_id(r: &ExtensionUiResponse) -> &str {
+    &r.id
 }

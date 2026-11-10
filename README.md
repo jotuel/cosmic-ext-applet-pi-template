@@ -2,7 +2,7 @@
 
 # cosmic-ext-applet-pi-template
 
-This is minimalistic starting point for your desktop panel, *or dock*, agent.
+This is minimalistic starting point for your desktop panel, *or dock*, agent using Pi Durable.
 
 It does not provide you with **x**, ***nor y***, for the sole purpose of letting you and the applet implement it.
 
@@ -22,7 +22,7 @@ sudo just install
 
 It just started to feel like I'd need to start using `git` at this point.
 
-This does not mean it absolutely for certain is finished. But as commits go this will only ever have the one.
+This does not mean it absolutely for certain is finished. But as commits go this branch will only ever have two.
 
 I remain open to the idea of amending it and force pushing changes when template changing ideas come up.
 

@@ -552,16 +552,16 @@ impl cosmic::Application for AppModel {
             Message::NewSession => {
                 if let Some(ref client) = self.client {
                     let client = Arc::clone(client);
-                    let task = Task::perform(
-                        async move {
-                            let _ = client.new_session(None).await;
+                    return Task::perform(
+                        async move { client.reset(None).await },
+                        |res| {
+                            cosmic::Action::from(Message::PiAction(
+                                PiAction::SessionResetCompleted(
+                                    res.map(|_| ()).map_err(|e| e.to_string()),
+                                ),
+                            ))
                         },
-                        |_| cosmic::Action::from(Message::Noop),
                     );
-                    if let Some(ref mut controller) = self.controller {
-                        controller.history_mut().clear();
-                    }
-                    return task;
                 }
                 Task::none()
             }
@@ -605,7 +605,17 @@ impl cosmic::Application for AppModel {
                     return Task::perform(
                         async move {
                             match client.cycle_model().await {
-                                Ok(Some(data)) => Ok(Some(data.model.id)),
+                                Ok(Some(data)) => {
+                                    let full_id = match data.model.provider {
+                                        Some(ref p)
+                                            if !p.is_empty() && !data.model.id.contains('/') =>
+                                        {
+                                            format!("{p}/{}", data.model.id)
+                                        }
+                                        _ => data.model.id,
+                                    };
+                                    Ok(Some(full_id))
+                                }
                                 Ok(None) => Ok(None),
                                 Err(e) => Err(e.to_string()),
                             }
@@ -640,9 +650,15 @@ impl cosmic::Application for AppModel {
 
             Message::SessionStateReceived(state) => {
                 if let Some(model) = state.model {
-                    self.config.default_model = Some(model.id.clone());
+                    let full_id = match model.provider {
+                        Some(ref p) if !p.is_empty() && !model.id.contains('/') => {
+                            format!("{p}/{}", model.id)
+                        }
+                        _ => model.id.clone(),
+                    };
+                    self.config.default_model = Some(full_id.clone());
                     if let Some(ref mut controller) = self.controller {
-                        controller.set_model(Some(model.id));
+                        controller.set_model(Some(full_id));
                         controller.set_model_context_window(model.context_window);
                     }
                 }
@@ -758,12 +774,17 @@ impl cosmic::Application for AppModel {
 
             Message::PiAction(action) => {
                 match &action {
-                    PiAction::Event(PiEvent::AgentSettled { aborted: false }) => {
+                    PiAction::Event(PiEvent::RunEnd { .. }) => {
                         if self.config.notify_on_complete && self.popup.is_none() {
                             notifications::notify_task_completed(
                                 "Task Completed",
                                 "Agent has finished running instructions.",
                             );
+                        }
+                    }
+                    PiAction::Event(PiEvent::AgentChanged { agent }) => {
+                        if let Some(ref model_ref) = agent.model {
+                            self.config.default_model = Some(model_ref.full_id());
                         }
                     }
                     PiAction::UiRequest(req)
@@ -971,22 +992,14 @@ mod tests {
     #[test]
     fn test_app_model_pi_action_events() {
         let mut app = AppModel::default();
-        let turn_end_event = PiEvent::TurnEnd {
-            message: pi_rpc::protocol::AgentMessage {
-                role: "assistant".into(),
-                content: serde_json::json!("Tool executed"),
-                timestamp: None,
-                extra: Default::default(),
-            },
-            tool_results: vec![],
-        };
+        let turn_end_event = PiEvent::TurnEnd;
         let _ = app.update(Message::PiAction(cosmic_ext_pi::PiAction::Event(
             turn_end_event,
         )));
 
-        let settled_event = PiEvent::AgentSettled { aborted: false };
+        let run_end_event = PiEvent::RunEnd { inputs: vec![1] };
         let _ = app.update(Message::PiAction(cosmic_ext_pi::PiAction::Event(
-            settled_event,
+            run_end_event,
         )));
     }
 

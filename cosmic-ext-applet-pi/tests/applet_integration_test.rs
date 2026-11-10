@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: EUPL-1.2
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use cosmic::Application;
 use cosmic_ext_applet_pi::app::{AppModel, Message};
 use cosmic_ext_applet_pi::config::Config;
 use cosmic_ext_applet_pi::popover;
 use cosmic_ext_pi::controller::AgentStatus;
+use pi_rpc::protocol::{InboxMode, MessageChange, PiEvent, QueuedItem};
+use pi_rpc::{PiClient, PiProcessConfig};
 
 #[test]
 fn test_integration_config_flow() {
@@ -62,7 +66,7 @@ async fn test_integration_popover_rendering_variants() {
         &config,
         None,
         false,
-        Some("Command failed: pi not found in $PATH"),
+        Some("Command failed: node not found in $PATH"),
         "",
         None,
         false,
@@ -74,7 +78,7 @@ async fn test_integration_popover_rendering_variants() {
     // Render with mock controller having active token usage
     let (client_stdin, _) = tokio::io::duplex(1024);
     let (_, client_stdout) = tokio::io::duplex(1024);
-    let client = std::sync::Arc::new(pi_rpc::PiClient::from_io(
+    let client = Arc::new(pi_rpc::PiClient::from_io(
         Box::new(client_stdin),
         Box::new(client_stdout),
         None,
@@ -83,7 +87,7 @@ async fn test_integration_popover_rendering_variants() {
     controller.set_model(Some("anthropic/claude-3-7-sonnet".into()));
     controller.set_model_context_window(Some(200_000));
     let _ = controller.update(cosmic_ext_pi::subscription::PiAction::Event(
-        pi_rpc::protocol::PiEvent::MessageUpdate {
+        PiEvent::MessageUpdate {
             usage: Some(pi_rpc::protocol::Usage {
                 input: 42_000,
                 output: 1_200,
@@ -94,7 +98,7 @@ async fn test_integration_popover_rendering_variants() {
                 total_tokens: 51_200,
                 cost: None,
             }),
-            assistant_message_event: pi_rpc::protocol::AssistantMessageEvent::Start,
+            changes: vec![],
         },
     ));
 
@@ -125,19 +129,30 @@ async fn test_integration_popover_rendering_variants() {
 
     // Render busy state with prompt input and queued steering/follow-up messages
     let _ = controller.update(cosmic_ext_pi::subscription::PiAction::Event(
-        pi_rpc::protocol::PiEvent::MessageUpdate {
+        PiEvent::MessageUpdate {
             usage: None,
-            assistant_message_event: pi_rpc::protocol::AssistantMessageEvent::ThinkingStart {
+            changes: vec![MessageChange::ThinkingStart {
                 content_index: 0,
-            },
+                block: serde_json::json!({ "type": "thinking", "thinking": "" }),
+            }],
         },
     ));
     assert!(controller.status().is_busy());
 
     let _ = controller.update(cosmic_ext_pi::subscription::PiAction::Event(
-        pi_rpc::protocol::PiEvent::QueueUpdate {
-            steering: vec!["Change algorithm".to_string()],
-            follow_up: vec!["Check performance afterwards".to_string()],
+        PiEvent::InboxUpdate {
+            items: vec![
+                QueuedItem {
+                    id: 1,
+                    mode: InboxMode::Steer,
+                    text: Some("Change algorithm".to_string()),
+                },
+                QueuedItem {
+                    id: 2,
+                    mode: InboxMode::FollowUp,
+                    text: Some("Check performance afterwards".to_string()),
+                },
+            ],
         },
     ));
 
@@ -150,6 +165,73 @@ async fn test_integration_popover_rendering_variants() {
         Some("anthropic/claude-3-7-sonnet"),
         false,
     );
+}
+
+#[tokio::test]
+async fn test_integration_applet_reload_restores_and_resumes_session() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "cosmic_applet_durable_reload_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    // 1. First applet session submits a prompt and finishes a turn
+    {
+        let cfg = PiProcessConfig::new()
+            .with_working_dir(&temp_dir)
+            .with_session_dir(&temp_dir)
+            .with_env("PI_CODING_AGENT_CORE_DIR", "/nonexistent");
+
+        let client = Arc::new(PiClient::spawn(cfg).await.unwrap());
+        let mut rx = client.subscribe_events();
+        client.prompt("Keep this across cosmic-panel reload").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(ev) = rx.recv().await {
+                if matches!(ev, PiEvent::RunEnd { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    // 2. Second applet instance (after cosmic-panel reload) spawns on the same project folder
+    {
+        let cfg = PiProcessConfig::new()
+            .with_working_dir(&temp_dir)
+            .with_session_dir(&temp_dir)
+            .with_env("PI_CODING_AGENT_CORE_DIR", "/nonexistent");
+
+        let client = Arc::new(PiClient::spawn(cfg).await.unwrap());
+        let mut rx = client.subscribe_events();
+
+        let snap = if let Some(s) = client.latest_snapshot() {
+            s
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(PiEvent::Snapshot(s)) = rx.recv().await {
+                        return s;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        };
+
+        let mut app = AppModel::default();
+        let _ = app.update(Message::PiSpawned(Ok(Arc::clone(&client))));
+        let _ = app.update(Message::PiAction(cosmic_ext_pi::PiAction::Event(
+            PiEvent::Snapshot(snap),
+        )));
+
+        assert_eq!(app.status(), AgentStatus::Idle);
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]

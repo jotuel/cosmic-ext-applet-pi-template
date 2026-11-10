@@ -8,22 +8,59 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::error::PiError;
 
-/// Configuration for launching the `pi` child process in RPC mode.
+const DURABLE_HOST_CJS: &str = include_str!("durable_host.cjs");
+
+/// Materializes the bundled Pi Durable Node host script to a local cache file
+/// and returns its path.
+pub fn ensure_durable_host_script() -> std::io::Result<PathBuf> {
+    static WRITE_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let base_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cosmic-ext-applet-pi");
+
+    std::fs::create_dir_all(&base_dir)?;
+    let script_path = base_dir.join("durable_host.cjs");
+
+    let needs_write = match std::fs::read_to_string(&script_path) {
+        Ok(existing) => existing != DURABLE_HOST_CJS,
+        Err(_) => true,
+    };
+
+    if needs_write {
+        let tmp_path = base_dir.join(format!(
+            "durable_host.{}.{}.tmp.cjs",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&tmp_path, DURABLE_HOST_CJS)?;
+        std::fs::rename(&tmp_path, &script_path)?;
+    }
+
+    Ok(script_path)
+}
+
+/// Configuration for launching the Pi Durable child process.
 #[derive(Debug, Clone)]
 pub struct PiProcessConfig {
-    /// Path to the `pi` executable. Defaults to `"pi"`.
+    /// Path to the Node executable (or custom host script/binary). Defaults to `"node"`.
     pub binary_path: PathBuf,
-    /// Working directory for the process.
+    /// Working directory for the process and conversation agent.
     pub working_dir: Option<PathBuf>,
     /// Model provider override (e.g. "anthropic", "openai", "radius").
     pub provider: Option<String>,
     /// Model identifier override (e.g. "claude-sonnet-4-20250514").
     pub model: Option<String>,
-    /// Directory where sessions should be stored.
+    /// Directory where durable SQLite session files should be stored.
     pub session_dir: Option<PathBuf>,
-    /// Run without persisting sessions (`--no-session`).
+    /// Run with in-memory storage instead of persisting SQLite (`--no-session`).
     pub no_session: bool,
-    /// Additional CLI arguments passed to `pi`.
+    /// Additional CLI arguments passed to the host process.
     pub extra_args: Vec<String>,
     /// Additional environment variables for the child process.
     pub env: HashMap<String, String>,
@@ -32,7 +69,7 @@ pub struct PiProcessConfig {
 impl Default for PiProcessConfig {
     fn default() -> Self {
         Self {
-            binary_path: PathBuf::from("pi"),
+            binary_path: PathBuf::from("node"),
             working_dir: None,
             provider: None,
             model: None,
@@ -90,20 +127,41 @@ impl PiProcessConfig {
     }
 }
 
-/// Handle to the spawned `pi` child process.
+/// Handle to the spawned Pi Durable child process.
 pub struct PiProcess {
     child: Child,
     recent_stderr: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl PiProcess {
-    /// Launches `pi --mode rpc` according to the provided configuration.
+    /// Launches the Pi Durable host process according to the provided configuration.
     ///
     /// Returns the captured `stdin` and `stdout` pipe streams alongside the supervisor handle.
     pub fn spawn(config: &PiProcessConfig) -> Result<(ChildStdin, ChildStdout, Self), PiError> {
-        let mut cmd = Command::new(&config.binary_path);
-        cmd.arg("--mode").arg("rpc");
+        let bin_str = config.binary_path.to_string_lossy();
+        let is_default_runner = bin_str == "node"
+            || bin_str == "pi"
+            || bin_str == "/usr/bin/pi"
+            || bin_str == "/usr/bin/node";
 
+        let mut cmd = if is_default_runner {
+            let host_script = ensure_durable_host_script().map_err(PiError::SpawnFailed)?;
+            let node_bin = if bin_str.ends_with("node") {
+                config.binary_path.clone()
+            } else {
+                PathBuf::from("node")
+            };
+            let mut c = Command::new(node_bin);
+            c.arg("--no-warnings").arg(host_script);
+            c
+        } else {
+            Command::new(&config.binary_path)
+        };
+
+        if let Some(ref cwd) = config.working_dir {
+            cmd.arg("--working-dir").arg(cwd);
+            cmd.current_dir(cwd);
+        }
         if config.no_session {
             cmd.arg("--no-session");
         }
@@ -118,9 +176,6 @@ impl PiProcess {
         }
         for arg in &config.extra_args {
             cmd.arg(arg);
-        }
-        if let Some(ref cwd) = config.working_dir {
-            cmd.current_dir(cwd);
         }
         for (k, v) in &config.env {
             cmd.env(k, v);
@@ -198,7 +253,7 @@ impl PiProcess {
             Ok(Ok(_status)) => Ok(()),
             Ok(Err(e)) => Err(PiError::Io(e)),
             Err(_) => {
-                tracing::warn!("Pi child did not exit within {:?}; force killing", timeout_dur);
+                tracing::warn!("Pi Durable child did not exit within {:?}; force killing", timeout_dur);
                 let _ = self.child.start_kill();
                 let _ = self.child.wait().await;
                 Ok(())

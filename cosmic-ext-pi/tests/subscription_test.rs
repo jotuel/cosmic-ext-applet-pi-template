@@ -17,17 +17,18 @@ async fn test_subscription_events_and_ui_requests() {
         None,
     ));
 
-    // Subscribe to client directly to verify raw stream
     let mut event_rx = client.subscribe_events();
     let mut ui_rx = client.subscribe_ui_requests();
 
     let server_handle = tokio::spawn(async move {
         let mut writer = JsonLinesWriter::new(&mut server_stdout);
 
-        // 1. Emit an event
+        // 1. Emit an agent_changed event
         let event = json!({
-            "type": "thinking_level_changed",
-            "level": "medium"
+            "type": "agent_changed",
+            "agent": {
+                "thinkingLevel": "medium"
+            }
         });
         writer.write_record(&event).await.unwrap();
 
@@ -42,12 +43,17 @@ async fn test_subscription_events_and_ui_requests() {
         writer.write_record(&req).await.unwrap();
     });
 
-    // Verify raw client subscription gets events
     let event = event_rx.recv().await.unwrap();
     assert_eq!(
         event,
-        PiEvent::ThinkingLevelChanged {
-            level: ThinkingLevel::Medium
+        PiEvent::AgentChanged {
+            agent: AgentState {
+                model: None,
+                thinking_level: Some(ThinkingLevel::Medium),
+                cwd: None,
+                instructions: None,
+                extra: Default::default(),
+            }
         }
     );
 

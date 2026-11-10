@@ -9,13 +9,13 @@ use pi_rpc::PiClient;
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum PiAction {
-    /// Connected to Pi background event stream.
+    /// Connected to Pi Durable background event stream.
     Connected,
 
     /// Disconnected from event or UI stream.
     Disconnected(String),
 
-    /// Session event emitted by Pi.
+    /// Session event emitted by Pi Durable.
     Event(PiEvent),
 
     /// Incoming UI request from Pi extension (e.g. confirm, select, input, editor).
@@ -118,10 +118,20 @@ fn run_subscription(data: &SubscriptionData) -> impl futures::Stream<Item = PiAc
     cosmic::iced::stream::channel(
         256,
         move |mut output: futures::channel::mpsc::Sender<PiAction>| async move {
-            let _ = output.send(PiAction::Connected).await;
-
             let mut event_rx = client.subscribe_events();
             let mut ui_rx = client.subscribe_ui_requests();
+
+            let _ = output.send(PiAction::Connected).await;
+
+            if let Some(snapshot) = client.latest_snapshot() {
+                if output
+                    .send(PiAction::Event(PiEvent::Snapshot(snapshot)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
 
             loop {
                 tokio::select! {

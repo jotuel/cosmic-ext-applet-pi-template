@@ -7,28 +7,19 @@ use pi_rpc::protocol::PiEvent;
 use pi_rpc::PiClient;
 
 const RECORDED_SESSION_JSONL: &str = r#"
-{"type":"agent_start"}
+{"type":"snapshot","entries":[],"tools":[],"nestedTools":[],"compactions":[],"inbox":[],"agent":{"model":{"provider":"radius","modelId":"balanced"},"thinkingLevel":"medium"},"usage":{"models":{},"tools":{}}}
+{"type":"run_start","inputs":[1]}
 {"type":"turn_start"}
 {"type":"message_start","message":{"role":"assistant","content":[],"timestamp":1700000000}}
-{"type":"message_update","assistantMessageEvent":{"type":"start"}}
-{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}
-{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"User wants to list files. I will use the bash tool."}}
-{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0,"content":null}}
-{"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"call_ls_123","toolName":"bash"}}
-{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{\"command\":\"ls -la\"}"}}
-{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"command":"ls -la"}}}
-{"type":"tool_execution_start","toolCallId":"call_ls_123","toolName":"bash","args":{"command":"ls -la"}}
-{"type":"tool_execution_update","toolCallId":"call_ls_123","toolName":"bash","args":{"command":"ls -la"},"partialResult":"total 8\n"}
-{"type":"tool_execution_end","toolCallId":"call_ls_123","toolName":"bash","result":"total 8\n-rw-r--r-- Cargo.toml\n-rw-r--r-- src/lib.rs","isError":false,"durationMs":42.5}
-{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":2}}
-{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":2,"delta":"Here are the files in the project:\n\n"}}
-{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":2,"delta":"- `Cargo.toml`\n- `src/lib.rs`\n"}}
-{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":2,"content":null}}
-{"type":"message_update","assistantMessageEvent":{"type":"done","reason":"stop"}}
-{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Here are the files in the project:\n\n- `Cargo.toml`\n- `src/lib.rs`\n"}],"timestamp":1700000005}}
-{"type":"turn_end","message":{"role":"assistant","content":[],"timestamp":1700000005},"toolResults":[]}
-{"type":"agent_end","messages":[],"willRetry":false}
-{"type":"agent_settled","aborted":false}
+{"type":"message_update","changes":[{"type":"thinking_start","contentIndex":0,"block":{"type":"thinking","thinking":""}},{"type":"thinking_delta","contentIndex":0,"delta":"User wants to list files. I will use the bash tool."},{"type":"toolcall_start","contentIndex":1,"block":{"type":"toolCall","id":"call_ls_123","name":"bash","arguments":{"command":"ls -la"}}}]}
+{"type":"message_end","entry":{"id":1,"conversationId":1,"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"thinking","thinking":"User wants to list files. I will use the bash tool."},{"type":"toolCall","id":"call_ls_123","name":"bash","arguments":{"command":"ls -la"}}],"timestamp":1700000001}]}}
+{"type":"tool_execution_start","toolCallId":"call_ls_123","toolName":"bash","taskId":10,"args":{"command":"ls -la"}}
+{"type":"tool_execution_update","toolCallId":"call_ls_123","toolName":"bash","taskId":10,"output":{"append":"total 8\n"}}
+{"type":"tool_execution_end","toolCallId":"call_ls_123","toolName":"bash","taskId":10,"entry":{"id":2,"conversationId":1,"kind":"pi.tool-result","model":[{"role":"toolResult","toolCallId":"call_ls_123","toolName":"bash","content":[{"type":"text","text":"total 8\n-rw-r--r-- Cargo.toml\n-rw-r--r-- src/lib.rs"}],"isError":false,"durationMs":42.5,"timestamp":1700000002}]}}
+{"type":"message_update","changes":[{"type":"text_start","contentIndex":2,"block":{"type":"text","text":""}},{"type":"text_delta","contentIndex":2,"delta":"Here are the files in the project:\n\n"},{"type":"text_delta","contentIndex":2,"delta":"- `Cargo.toml`\n- `src/lib.rs`\n"}]}
+{"type":"message_end","entry":{"id":3,"conversationId":1,"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"thinking","thinking":"User wants to list files. I will use the bash tool."},{"type":"toolCall","id":"call_ls_123","name":"bash","arguments":{"command":"ls -la"}},{"type":"text","text":"Here are the files in the project:\n\n- `Cargo.toml`\n- `src/lib.rs`\n"}],"timestamp":1700000005}]}}
+{"type":"turn_end"}
+{"type":"run_end","inputs":[1]}
 "#;
 
 #[tokio::test]
